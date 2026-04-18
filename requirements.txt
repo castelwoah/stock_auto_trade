@@ -1,0 +1,4 @@
+requests>=2.32
+PyYAML>=6.0
+pydantic>=2.7
+pydantic-settings>=2.5
