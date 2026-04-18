@@ -8,7 +8,7 @@
 ## Tech Stack
 
 - **Language**: Python 3.10 (dev) / **3.11+ 목표** (rules)
-- **Dependencies**: `requirements.txt` — requests, PyYAML, pydantic, pydantic-settings (pandas는 legacy만 사용)
+- **Dependencies**: `requirements.txt` — requests, PyYAML, pydantic, pydantic-settings, SQLAlchemy / dev: pytest (pandas는 legacy만 사용)
 - **External API**: 한국투자증권 Open Trading API (`openapi.koreainvestment.com:9443`)
 - **Notification**: Discord Webhook
 
@@ -28,10 +28,24 @@ mini_project/
 ├── .gitignore              # 민감 파일·빌드 산출물 제외 규칙
 ├── src/                    # W1+ 신규 구조 (legacy 이관 중)
 │   ├── config.py           # pydantic Settings, ENV>.env>YAML>default 우선순위
-│   └── clients/
-│       ├── rate_limiter.py # Token Bucket (기본 20 rps)
-│       ├── discord.py      # DiscordNotifier (webhook)
-│       └── kis.py          # KisClient + TokenStore (일별 파일 캐시, expired 자동 이동)
+│   ├── clients/
+│   │   ├── rate_limiter.py # Token Bucket (기본 20 rps)
+│   │   ├── discord.py      # DiscordNotifier (webhook)
+│   │   └── kis.py          # KisClient + TokenStore (일별 파일 캐시, expired 자동 이동)
+│   ├── ingestion/          # W2 신설
+│   │   ├── base_scraper.py # BaseScraper + Article dataclass (계약)
+│   │   ├── dedup.py        # URL 정규화 + SimHash64 + Hamming distance
+│   │   ├── symbol_resolver.py  # 종목명/코드 → symbol (GENERIC_STOPWORDS 반감, D4)
+│   │   └── scrapers/
+│   │       ├── dart.py                # OpenDART list.json (실구현, 페이지네이션)
+│   │       ├── yonhap_rss.py          # 연합뉴스 RSS 2.0 (stdlib XML, 실구현)
+│   │       ├── naver_disclosure.py    # 스캐폴드 (TODO: HTML 실구현 + 법무)
+│   │       └── kis_news.py            # 스캐폴드 (TODO: KIS TR_ID 확정)
+│   └── persistence/        # W2 신설
+│       ├── db.py           # SQLAlchemy engine/session, session_scope, init_db
+│       └── models.py       # 8 tables: NewsArticle, ArticleSymbol, StockScore, Trade(idem UNIQUE), Position(symbol+strategy_id PK), RiskEvent, DailyPnl, CashFlow
+├── tests/                  # W2 신설
+│   └── ingestion/          # 27개 테스트 (dart 7 + yonhap 9 + naver 6 + kis 5)
 └── .claude/
     └── project-rules.md    # 자동매매 에이전트 시스템 프롬프트 v2.0 (차기 설계 방향성)
 ```
@@ -245,6 +259,18 @@ W8 (모의투자)   → 단일 세션 (관찰·튜닝)
     - **legacy 대비 개선**: 전역 `ACCESS_TOKEN` 제거(인스턴스 필드), `print` → `logging`, 토큰 경로 하드코딩 제거(`Settings.TOKEN_DIR` 주입), 응답 실패 시 명시적 예외 발생.
     - **스모크 검증 통과**: 설정 로드, Token Bucket burst/대기 타이밍(< 1ms / ≈200ms), 클라이언트 인스턴스 초기화. 실 API 호출은 미실행(안전).
     - **Phase 1 Gate "legacy 동작 동일성 검증"**: 함수 시그니처/TR_ID 레벨 매핑 완료. 실주행 동등성 검증은 W2 수집 파이프라인 연동 시점에 수행 예정.
+- **W1 커밋**: `12dc2e2` — src/ 골격 9 files, +1081 insertions.
+- **W2 완료 (Ingestion + Persistence + Dedup, Agent×4 병렬 적용)**:
+    - 메인 단일 세션: `ingestion/base_scraper.py`(BaseScraper ABC + Article frozen dataclass + `_get()` 공통 HTTP + 1s 최소 지연 + UA 명시), `ingestion/dedup.py`(URL 정규화·SHA-256 url_hash·SimHash64·Hamming·signed↔unsigned 변환), `ingestion/symbol_resolver.py`(이름 exact + 6자리 코드 매칭 + GENERIC_STOPWORDS 반감으로 D4 ambiguity<0.8 차단), `persistence/models.py`(8 테이블: NewsArticle / ArticleSymbol / StockScore / Trade [idempotency UNIQUE · D8] / Position [(symbol, strategy_id) 복합PK · D2·D3 highest_price] / RiskEvent / DailyPnl / CashFlow [D7 분리]), `persistence/db.py`(SQLite/PG 자동 분기, `session_scope()` + `init_db()`), `config.py` 확장(`DATABASE_URL`, `DART_API_KEY`).
+    - 서브에이전트 Agent×4 병렬 실행 (약 6분 총 소요):
+      * `scrapers/dart.py` — OpenDART `list.json` 실구현. 페이지네이션, corp_code 매핑, status 013(no data) 정상 처리. 테스트 7/7 통과.
+      * `scrapers/yonhap_rss.py` — 연합뉴스 RSS 2.0 실구현 (stdlib xml.etree + email.utils.parsedate_to_datetime). 기본 피드 5개(economy/market/industry/finance/stock). 개별 피드 실패 시 격리. 테스트 9/9 통과.
+      * `scrapers/naver_disclosure.py` — **스캐폴드**. finance.naver.com HTML 구조·robots.txt·ToS 검증 필요. 실구현 TODO 주석 6단계 명시. `NotImplementedError` 방어. 테스트 6/6 통과.
+      * `scrapers/kis_news.py` — **스캐폴드**. KIS 개발자 포털에서 TR_ID(`FHKST03010100`류 후보) 확정 필요. KIS Rate limit은 기존 `TokenBucket`이 공유 관리. 테스트 5/5 통과.
+    - **트러스트 버트 베리파이**: 메인이 4개 파일 전부 직접 Read하여 계약 준수 확인. 두 실구현 모두 `BaseScraper._get()`만 사용하여 UA·1s 지연 강제.
+    - **전체 테스트 27/27 pass** (pytest 9.0.3).
+    - **W2 Gate 상태**: 계약·DB·2개 실구현 + 2개 스캐폴드 확보. "7일간 수집 이상 無" 실주행 검증은 Phase 1 후반(스케줄러 가동 시)에 수행.
+    - **requirements.txt**에 `SQLAlchemy>=2.0`, `pytest>=8.0` 추가.
 
 ## Notes
 

@@ -33,6 +33,10 @@ class Settings(BaseSettings):
     TOKEN_DIR: Path = Field(default_factory=lambda: PROJECT_ROOT)
     TOKEN_BUCKET_CAPACITY: int = 20
     TOKEN_BUCKET_REFILL_RATE: float = 20.0
+    DATABASE_URL: str = Field(
+        default_factory=lambda: f"sqlite:///{PROJECT_ROOT / 'trading.db'}"
+    )
+    DART_API_KEY: SecretStr | None = None
 
     model_config = SettingsConfigDict(
         env_file=str(PROJECT_ROOT / ".env"),
