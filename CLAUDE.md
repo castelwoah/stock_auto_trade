@@ -66,6 +66,11 @@ mini_project/
 │   │   ├── daily_report.py  # render_text (rules §7.1 재현) + render_embed (색상 분기) + send_daily_report
 │   │   ├── intraday.py      # 체결(매수 녹·매도 손익별) / 리스크(주황) 즉시 Embed + notify_* helpers
 │   │   └── archiver.py      # 일별 JSON + trades CSV + 연간 세금 CSV (utf-8-sig, 멱등)
+│   ├── backtest/           # W7 린 신설 (v2)
+│   │   ├── portfolio_sim.py # SimFill/SimPosition + idempotency D8 + 왕복 1.03% 비용 (slip 0.25+fee 0.15+tax 0.23)
+│   │   ├── engine.py        # bar-by-bar 루프, risk_engine 의존 주입, Registry + sim + loader 통합
+│   │   ├── data_loader.py   # BacktestDataLoader ABC + SyntheticDataLoader(seed) + CsvDataLoader + D5 60초 필터 (단일 위치)
+│   │   └── metrics.py       # Sharpe(252) / MDD / Win rate / PF(999 sentinel) / CAGR / Alpha + snapshot fixture
 │   └── persistence/        # W2 신설
 │       ├── db.py           # SQLAlchemy engine/session, session_scope, init_db
 │       └── models.py       # 8 tables: NewsArticle, ArticleSymbol, StockScore, Trade(idem UNIQUE), Position(symbol+strategy_id PK), RiskEvent, DailyPnl, CashFlow
@@ -74,7 +79,9 @@ mini_project/
 │   ├── analysis/           # 68개 테스트 (scorer/news/sentiment 22 + tech 15 + fin 15 + flow 12 + integration 4)
 │   ├── risk/               # 82개 테스트 (blacklist 9 + market 12 + sizing 19 + limits 20 + engine 22) — 커버리지 100%
 │   ├── strategy/           # 75개 테스트 (base 4 + exit 21 + breakout 12 + registry 12 + news_swing 18 + integration 8) — 커버리지 99%
-│   └── reporting/          # 40개 테스트 (daily 14 + intraday 11 + archiver 15) — 커버리지 97%
+│   ├── reporting/          # 40개 테스트 (daily 14 + intraday 11 + archiver 15) — 커버리지 97%
+│   └── backtest/           # 51개 테스트 (portfolio 18 + metrics 11 + data_loader 13 + engine integration 9) — 커버리지 94%
+│       └── fixtures/metrics_snapshot.json  # W7 회귀 검증 기준
 └── .claude/
     └── project-rules.md    # 자동매매 에이전트 시스템 프롬프트 v2.0 (차기 설계 방향성)
 ```
@@ -341,6 +348,22 @@ W8 (모의투자)   → 단일 세션 (관찰·튜닝)
       * `archiver.py` — `<root>/YYYY/YYYY-MM-DD.{json,-trades.csv}` + 연간 `tax-YYYY.csv`. JSON `ensure_ascii=False`, CSV `utf-8-sig` (엑셀 한글 호환). 세금 CSV append 모드에서 신규 파일에만 BOM 수동 기록(중복 BOM 방지). 중복 키 `(date, symbol, qty)` 로 append 멱등. `write_daily_report` 덮어쓰기 멱등.
     - **W6 Gate 달성**: rules §7.1 포맷 재현 (모든 섹션 헤더 8종 + 숫자 포맷팅 + '근거/반성' 태그), Embed 색상 코드 4종 분기 확인, 아카이브 경로·멱등·UTF-8 BOM·한글 라운드트립 검증.
     - 테스트 40/40 pass, reporting/* 커버리지 **97%**. 전체 누적 **292/292 pass**.
+- **W6 커밋**: `34c9e17` — 10 files, +1214 insertions.
+- **Phase 2·3 진행 방식 확정 — 옵션 B v2 (W7 린 + W8 병행)**:
+    - 배경: 원안 W7 풀스펙(1~2주 walk-forward)은 Phase 2 게이트가 backtest 에 과도 의존하게 되고, W1~W6 에 이미 `@risk_gate`/idempotency/reconciler 계획이 확보되어 있어 **W7 을 실전 피드백 이후로 확장하는 편이 효율적**.
+    - 17개 개선점 자체검토 결과 v2 반영: Dry-run 3영업일, Budget 현실화(W7 린 2~3일 / W8 인프라 5일), 스키마 변경 대신 `RiskEvent` 재사용(rules §4.2 준수), 슬리피지+수수료+거래세 왕복 **1.03%** 정확 반영, Agent 배분 일관성(metrics·data_loader·calendar·runbook 4건), Paper watchlist **legacy 12 + 시총 상위 18 = 30종목 제한**, 괴리 측정식 `|paper_return - backtest_return| / max(|backtest_return|, 1%) < 20%`, Reconciler 수동 재가동 UX(`docs/runbook.md`), D5 필터 책임은 `data_loader` 단일 위치, KIS PAPER 한계(체결 엔진이 VI·하한가·부분체결 완전 재현 X) 명시.
+    - **W7 린 scope**: `backtest/{portfolio_sim, engine, data_loader, metrics}.py` + tests. Gate = "수학적 정확성" (Sharpe 수식 + snapshot fixture + 회귀 테스트), 커버리지 ≥ 85%. **Sharpe > 1.0 수치 게이트는 W7 확장(실 데이터)으로 이월**.
+    - **W8 인프라 scope**: `execution/{portfolio, order_manager, reconciler, pipeline}.py` + `scheduler/{app, calendar, watchlist}.py` + `main.py` + `docs/runbook.md`. 금지 영역: `reconciler`, `order_manager`. Dry-run 3영업일(월/화/수).
+    - **W7 확장은 W8 paper Week 2 이후 병행**(주 4~8h). 실 3년 데이터·walk-forward 는 Phase 3 완료 시점까지 사후 충족 목표.
+- **W7 린 완료 (Backtest 계층, 메인 2개 + Agent×2)**:
+    - 메인 `backtest/portfolio_sim.py` — `PortfolioSim` 클래스 (슬리피지 0.25% / 수수료 0.15% / 거래세 0.23% 매도만, 왕복 1.03% 정확 반영), `SimFill` dataclass (idempotency_key UNIQUE D8), `SimPosition` (highest_price·tp_armed D3 지원), `current_positions_as_state(prices)` 로 Strategy 레이어 PositionState 변환, `mark_to_market` / `equity()` / 부분 체결 금지 / 현금 부족 시 전량 스킵.
+    - 메인 `backtest/engine.py` — `BacktestEngine` bar-by-bar 이벤트 루프 (기본 5분 간격 09:10~15:20), `business_days()` Mon-Fri 필터, `_run_day` 에서 09:00 open_equity 고정 후 RiskEngineBuilder 호출 (D7), `_build_buy_context` 에서 sim 상태로 BuyContext 구성, `check_buy/sell` 실패 시 `skips` 에 `risk:{code}` 기록, `registry.mark_executed` 로 signal_id 중복 방지.
+    - 서브에이전트 Agent×2 병렬 (143초/232초):
+      * `backtest/metrics.py` — `BacktestMetrics` dataclass + `compute_metrics()`. Sharpe 연율화 252 (KRX 246~250 대비 보수적, US 관행 호환), MDD 누적 최고가 기준, FIFO BUY↔SELL 매칭으로 avg_holding_days, profit_factor 무한대 방지용 999.0 sentinel (JSON 직렬화 호환). snapshot fixture `tests/backtest/fixtures/metrics_snapshot.json` 회귀 기준. 11 테스트 통과.
+      * `backtest/data_loader.py` — `BacktestDataLoader` ABC + `SyntheticDataLoader`(seed 기반 재현성, daily vol 1.5%, 종목별 분리 시드) + `CsvDataLoader`. **D5 look-ahead 60초 필터를 단일 위치(`news` 메서드)** 에 둠 → engine 에서 추가 필터 금지(이중 배제 방지). 13 테스트 통과.
+    - **Trust-but-verify 통합 이슈 1건 해결**: engine 은 직전 영업일 close 필요 → 테스트 로더 범위를 시작일보다 7일 앞으로 확장 (실 데이터에서는 히스토리 자연 확보).
+    - **W7 린 Gate 달성**: **51/51 pass** (portfolio 18 + metrics 11 + data_loader 13 + engine integration 9), `backtest/*` 커버리지 **94%** (Gate 85% 초과). Sharpe/MDD/PF 수학적 정확성 snapshot fixture 로 회귀 보장. **수치 Sharpe > 1.0 게이트는 W7 확장 실 데이터로 사후 충족 예정**.
+    - **전체 누적**: **343/343 pass** (ingestion 27 + analysis 68 + risk 82 + strategy 75 + reporting 40 + backtest 51).
 
 ## Notes
 

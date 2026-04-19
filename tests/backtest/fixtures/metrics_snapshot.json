@@ -1,0 +1,89 @@
+{
+  "_description": "Snapshot fixture for compute_metrics. 10-day equity curve (10,000,000 -> 10,500,000, mid-MDD -3%), 2 closed trades (+200,000 / -50,000), 1 open BUY.",
+  "initial_cash": 10000000.0,
+  "equity_curve": [
+    ["2026-01-05T15:30:00", 10000000.0],
+    ["2026-01-06T15:30:00", 10200000.0],
+    ["2026-01-07T15:30:00",  9894000.0],
+    ["2026-01-08T15:30:00", 10050000.0],
+    ["2026-01-09T15:30:00", 10100000.0],
+    ["2026-01-12T15:30:00", 10150000.0],
+    ["2026-01-13T15:30:00", 10200000.0],
+    ["2026-01-14T15:30:00", 10300000.0],
+    ["2026-01-15T15:30:00", 10400000.0],
+    ["2026-01-16T15:30:00", 10500000.0]
+  ],
+  "fills": [
+    {
+      "ts": "2026-01-05T09:10:00",
+      "symbol": "AAA",
+      "side": "BUY",
+      "qty": 10,
+      "price": 1000.0,
+      "fee": 15.0,
+      "tax": 0.0,
+      "strategy_id": "vol_breakout",
+      "idempotency_key": "k1",
+      "pnl_krw": null
+    },
+    {
+      "ts": "2026-01-08T14:30:00",
+      "symbol": "AAA",
+      "side": "SELL",
+      "qty": 10,
+      "price": 21000.0,
+      "fee": 315.0,
+      "tax": 483.0,
+      "strategy_id": "vol_breakout",
+      "idempotency_key": "k2",
+      "pnl_krw": 200000.0
+    },
+    {
+      "ts": "2026-01-07T10:00:00",
+      "symbol": "BBB",
+      "side": "BUY",
+      "qty": 5,
+      "price": 2000.0,
+      "fee": 15.0,
+      "tax": 0.0,
+      "strategy_id": "vol_breakout",
+      "idempotency_key": "k3",
+      "pnl_krw": null
+    },
+    {
+      "ts": "2026-01-12T14:00:00",
+      "symbol": "BBB",
+      "side": "SELL",
+      "qty": 5,
+      "price": 1990.0,
+      "fee": 15.0,
+      "tax": 23.0,
+      "strategy_id": "vol_breakout",
+      "idempotency_key": "k4",
+      "pnl_krw": -50000.0
+    },
+    {
+      "ts": "2026-01-13T10:00:00",
+      "symbol": "CCC",
+      "side": "BUY",
+      "qty": 3,
+      "price": 500.0,
+      "fee": 2.25,
+      "tax": 0.0,
+      "strategy_id": "vol_breakout",
+      "idempotency_key": "k5",
+      "pnl_krw": null
+    }
+  ],
+  "expected": {
+    "total_return_pct": 5.0,
+    "max_drawdown_pct": -3.0,
+    "win_rate": 0.5,
+    "profit_factor": 4.0,
+    "avg_win_krw": 200000.0,
+    "avg_loss_krw": -50000.0,
+    "trade_count": 2,
+    "avg_holding_days": 4.0,
+    "alpha_vs_benchmark_pct": null
+  }
+}
