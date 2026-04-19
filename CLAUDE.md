@@ -55,13 +55,20 @@ mini_project/
 │   │   ├── market_state.py # MarketState, KOSPI -3% / VI / 상·하한가 ±25% / 갭상승 5%+
 │   │   ├── sizing.py       # 종목 20% / 섹터 40% / Kelly/4 / 균등 1/N / lot 정렬
 │   │   └── limits.py       # DailyLossState / CircuitBreaker / CooldownPolicy + RiskEngine + @risk_gate
+│   ├── strategy/           # W5 신설
+│   │   ├── base.py          # Signal / Action enum / Strategy ABC / PositionState / StrategyContext
+│   │   ├── exit_signals.py  # SL -5% / TP +7% arm / Trailing -3% / event_exit / evaluate_exit / update_peak
+│   │   ├── breakout.py      # 변동성 돌파 legacy 포팅, 15:00 매수 중단 / 15:15 EOD 청산
+│   │   ├── news_swing.py    # 뉴스 스코어 기반 스윙 (5~10종목, 당일 청산 없음)
+│   │   └── registry.py      # 서브포트폴리오 현금 할당 + 신호 라우팅 (D2 격리, 금지 영역)
 │   └── persistence/        # W2 신설
 │       ├── db.py           # SQLAlchemy engine/session, session_scope, init_db
 │       └── models.py       # 8 tables: NewsArticle, ArticleSymbol, StockScore, Trade(idem UNIQUE), Position(symbol+strategy_id PK), RiskEvent, DailyPnl, CashFlow
 ├── tests/                  # W2·W3·W4 확장
 │   ├── ingestion/          # 27개 테스트 (dart 7 + yonhap 9 + naver 6 + kis 5)
 │   ├── analysis/           # 68개 테스트 (scorer/news/sentiment 22 + tech 15 + fin 15 + flow 12 + integration 4)
-│   └── risk/               # 82개 테스트 (blacklist 9 + market 12 + sizing 19 + limits 20 + engine 22) — 커버리지 100%
+│   ├── risk/               # 82개 테스트 (blacklist 9 + market 12 + sizing 19 + limits 20 + engine 22) — 커버리지 100%
+│   └── strategy/           # 75개 테스트 (base 4 + exit 21 + breakout 12 + registry 12 + news_swing 18 + integration 8) — 커버리지 99%
 └── .claude/
     └── project-rules.md    # 자동매매 에이전트 시스템 프롬프트 v2.0 (차기 설계 방향성)
 ```
@@ -310,6 +317,17 @@ W8 (모의투자)   → 단일 세션 (관찰·튜닝)
     - `risk/limits.py` — `DailyLossState.loss_pct`(start_equity=D7 09:00 값 기준), `CircuitBreakerState.evaluate`(연속 3일 손실 or 누적 -10% 자동 triggered), `CooldownPolicy`(재매수 3일/손절 후 재진입 10일), `check_cooldown`이 영업일만 카운트(공휴일 캘린더 W6+), `RiskEngine.check_buy` 9단계 게이트(CB → DL → KOSPI → 블랙리스트 → 유동성 → 심볼상태 → 쿨다운 → 사이징 헤드룸 → 의도 금액), `check_sell`은 정지 종목만 차단, **D14 구현 `@risk_gate` 데코레이터 + `set_risk_engine`/`get_risk_engine` ContextVar API** — 엔진 미설치 시 `RuntimeError`로 fail-loud, `symbol`/`side` kwarg 강제, BUY는 `buy_context: BuyContext` 필수.
     - **W4 Gate 달성**: 82/82 pass, **risk/* 커버리지 100%**. 전체 누적 177/177 pass.
     - **설계 의도**: 매수 경로는 9중 관문이 모두 통과해야 호출 진입, 매도 경로는 청산 차단 사유를 최소화하여 리스크 저감 경로를 보존. `@risk_gate` 우회 불가(엔진 미설치 시 호출 자체가 예외).
+- **W4 커밋**: `7c280ce` — 13 files, +1370 insertions.
+- **W5 완료 (Strategy 계층, 메인 4개 + Agent×1)**:
+    - 메인 단일 세션 (registry는 서브에이전트 금지 영역):
+      * `strategy/base.py` — `Action` enum(BUY/SELL/HOLD), `Signal`(strategy_id·signal_id·notional·qty), `PositionState`(highest_price·tp_armed D3 지원), `StrategyContext`(cash_available·candidate_scores·current_prices·prev_day_ohlc), `Strategy` ABC (`owned_positions`가 strategy_id 필터).
+      * `strategy/exit_signals.py` — pure: `should_stop_loss`(-5%), `should_arm_trailing`(+7%), `should_trailing_stop`(-3%), `event_exit_reason`(daily_loss_liquidation > halted > managed_stock > vi_repeated > score_collapse), `evaluate_exit` 우선순위 aggregator (event > stop_loss > trailing), `update_peak`(D3 Trailing 상태 갱신 — armed 플래그 sticky).
+      * `strategy/breakout.py` — legacy 동작 포팅. 목표가 = `open + (high - low) × 0.5`, 15:00 신규 매수 중단, 15:15 EOD 전량 청산, 당일 중 4중 방어 병행.
+      * `strategy/registry.py` — **서브포트폴리오 현금 격리** (등록 시 `allocation_pct`, 합 ≤ 100%), `_build_sub_context`가 해당 전략 소유 포지션만 격리 주입 (D2), `all_signals()`는 **exits → entries** 순서로 수집(리스크 저감 우선), `signal_id` 집합으로 중복 방지 (D8), 전략 예외 격리 (한 전략 실패가 다른 전략에 전파 안 됨), `build_idempotency_key` 는 `date:symbol:strategy_id:signal_id|action` 포맷.
+    - 서브에이전트 Agent×1 (131초):
+      * `strategy/news_swing.py` — 스코어 ≥70 정렬, 15:00 이후 매수 중단, 당일 청산 없음 (스윙 보유), exit에서 `extras` 입력 기반 halted/managed/vi/daily_loss 이벤트 전파, 누락 score는 중립 50 가정. 18 테스트 통과.
+    - **통합 테스트 8건**: Registry 라우팅이 strategy_id 를 전파, cash 할당 격리, idempotency_key 유일성, `@risk_gate`가 유효 시그널 통과 / 블랙리스트 차단 / Daily Loss 는 entries만 차단하고 exits 허용, breakout EOD 시그널도 게이트 통과, exits가 entries보다 먼저 emit 되는 리스크 저감 흐름.
+    - **W5 Gate 달성**: 전체 누적 **252/252 pass**, strategy/* 커버리지 **99%** (1줄은 news_swing 가드 분기).
 
 ## Notes
 
