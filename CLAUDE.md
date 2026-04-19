@@ -61,6 +61,11 @@ mini_project/
 │   │   ├── breakout.py      # 변동성 돌파 legacy 포팅, 15:00 매수 중단 / 15:15 EOD 청산
 │   │   ├── news_swing.py    # 뉴스 스코어 기반 스윙 (5~10종목, 당일 청산 없음)
 │   │   └── registry.py      # 서브포트폴리오 현금 할당 + 신호 라우팅 (D2 격리, 금지 영역)
+│   ├── reporting/          # W6 신설
+│   │   ├── models.py        # DailyReport / MarketSummary / DataCollectionSummary / TradeEntry / PortfolioState / RiskStatus
+│   │   ├── daily_report.py  # render_text (rules §7.1 재현) + render_embed (색상 분기) + send_daily_report
+│   │   ├── intraday.py      # 체결(매수 녹·매도 손익별) / 리스크(주황) 즉시 Embed + notify_* helpers
+│   │   └── archiver.py      # 일별 JSON + trades CSV + 연간 세금 CSV (utf-8-sig, 멱등)
 │   └── persistence/        # W2 신설
 │       ├── db.py           # SQLAlchemy engine/session, session_scope, init_db
 │       └── models.py       # 8 tables: NewsArticle, ArticleSymbol, StockScore, Trade(idem UNIQUE), Position(symbol+strategy_id PK), RiskEvent, DailyPnl, CashFlow
@@ -68,7 +73,8 @@ mini_project/
 │   ├── ingestion/          # 27개 테스트 (dart 7 + yonhap 9 + naver 6 + kis 5)
 │   ├── analysis/           # 68개 테스트 (scorer/news/sentiment 22 + tech 15 + fin 15 + flow 12 + integration 4)
 │   ├── risk/               # 82개 테스트 (blacklist 9 + market 12 + sizing 19 + limits 20 + engine 22) — 커버리지 100%
-│   └── strategy/           # 75개 테스트 (base 4 + exit 21 + breakout 12 + registry 12 + news_swing 18 + integration 8) — 커버리지 99%
+│   ├── strategy/           # 75개 테스트 (base 4 + exit 21 + breakout 12 + registry 12 + news_swing 18 + integration 8) — 커버리지 99%
+│   └── reporting/          # 40개 테스트 (daily 14 + intraday 11 + archiver 15) — 커버리지 97%
 └── .claude/
     └── project-rules.md    # 자동매매 에이전트 시스템 프롬프트 v2.0 (차기 설계 방향성)
 ```
@@ -328,6 +334,13 @@ W8 (모의투자)   → 단일 세션 (관찰·튜닝)
       * `strategy/news_swing.py` — 스코어 ≥70 정렬, 15:00 이후 매수 중단, 당일 청산 없음 (스윙 보유), exit에서 `extras` 입력 기반 halted/managed/vi/daily_loss 이벤트 전파, 누락 score는 중립 50 가정. 18 테스트 통과.
     - **통합 테스트 8건**: Registry 라우팅이 strategy_id 를 전파, cash 할당 격리, idempotency_key 유일성, `@risk_gate`가 유효 시그널 통과 / 블랙리스트 차단 / Daily Loss 는 entries만 차단하고 exits 허용, breakout EOD 시그널도 게이트 통과, exits가 entries보다 먼저 emit 되는 리스크 저감 흐름.
     - **W5 Gate 달성**: 전체 누적 **252/252 pass**, strategy/* 커버리지 **99%** (1줄은 news_swing 가드 분기).
+- **W5 커밋**: `75dce15` — 14 files, +1603 insertions.
+- **W6 완료 (Reporting 계층, 메인 3개 + Agent×1)**:
+    - 메인: `reporting/models.py`(rules §7.1 필드 매핑 dataclass — 모두 frozen), `daily_report.py`(`render_text` rules §7.1 포맷 재현 + `render_embed` 색상 자동 분기 [녹 이익·빨 손실·주황 CB·파 중립] + `send_daily_report(mode=embed|text)`), `intraday.py`(`render_buy_embed`/`render_sell_embed`(손익 부호별 색상)/`render_risk_embed`(주황) + `notify_*` transport helper, `DiscordNotifier.send_embed()` 재사용).
+    - 서브에이전트 Agent×1 (127초):
+      * `archiver.py` — `<root>/YYYY/YYYY-MM-DD.{json,-trades.csv}` + 연간 `tax-YYYY.csv`. JSON `ensure_ascii=False`, CSV `utf-8-sig` (엑셀 한글 호환). 세금 CSV append 모드에서 신규 파일에만 BOM 수동 기록(중복 BOM 방지). 중복 키 `(date, symbol, qty)` 로 append 멱등. `write_daily_report` 덮어쓰기 멱등.
+    - **W6 Gate 달성**: rules §7.1 포맷 재현 (모든 섹션 헤더 8종 + 숫자 포맷팅 + '근거/반성' 태그), Embed 색상 코드 4종 분기 확인, 아카이브 경로·멱등·UTF-8 BOM·한글 라운드트립 검증.
+    - 테스트 40/40 pass, reporting/* 커버리지 **97%**. 전체 누적 **292/292 pass**.
 
 ## Notes
 
