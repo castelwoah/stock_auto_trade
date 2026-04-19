@@ -49,12 +49,19 @@ mini_project/
 │   │   ├── technical.py    # RSI14 Wilder + MA5/20/60 + MACD (3봉 cross 창, eps 1e-9)
 │   │   ├── financial.py    # 부채비율·ROE·영업이익률·OCF, 균등 평균
 │   │   └── flow.py         # 외국인·기관 5d 순매수, 5d/60d 거래량비 (market_cap 정규화)
+│   ├── risk/               # W4 신설 (서브에이전트 금지 영역)
+│   │   ├── exceptions.py   # RiskBlocked(code, detail)
+│   │   ├── blacklist.py    # StaticBlacklist + LiquidityThresholds (시총<500억/거래대금<10억)
+│   │   ├── market_state.py # MarketState, KOSPI -3% / VI / 상·하한가 ±25% / 갭상승 5%+
+│   │   ├── sizing.py       # 종목 20% / 섹터 40% / Kelly/4 / 균등 1/N / lot 정렬
+│   │   └── limits.py       # DailyLossState / CircuitBreaker / CooldownPolicy + RiskEngine + @risk_gate
 │   └── persistence/        # W2 신설
 │       ├── db.py           # SQLAlchemy engine/session, session_scope, init_db
 │       └── models.py       # 8 tables: NewsArticle, ArticleSymbol, StockScore, Trade(idem UNIQUE), Position(symbol+strategy_id PK), RiskEvent, DailyPnl, CashFlow
-├── tests/                  # W2·W3 확장
+├── tests/                  # W2·W3·W4 확장
 │   ├── ingestion/          # 27개 테스트 (dart 7 + yonhap 9 + naver 6 + kis 5)
-│   └── analysis/           # 68개 테스트 (scorer/news/sentiment 22 + tech 15 + fin 15 + flow 12 + integration 4)
+│   ├── analysis/           # 68개 테스트 (scorer/news/sentiment 22 + tech 15 + fin 15 + flow 12 + integration 4)
+│   └── risk/               # 82개 테스트 (blacklist 9 + market 12 + sizing 19 + limits 20 + engine 22) — 커버리지 100%
 └── .claude/
     └── project-rules.md    # 자동매매 에이전트 시스템 프롬프트 v2.0 (차기 설계 방향성)
 ```
@@ -294,6 +301,15 @@ W8 (모의투자)   → 단일 세션 (관찰·튜닝)
       2. MACD cross 검출이 최종 1봉에만 작동해 실제 signal 놓침 → 최근 3봉 창 내 스캔으로 확장.
     - **W3 Gate 달성**: 스코어링 100종목 < 10초 (실측 수십 ms). 전체 테스트 **95/95 pass** (W1·W2·W3 누적).
     - **통합 테스트 4건**: 이상적 종목(뉴스 호재+정배열+우량재무+수급유입) → candidate 편입 확인, 악재 종목 → threshold 미달, technical insufficient → candidacy 차단, DB row에 재현성 필드 모두 포함.
+- **W3 커밋**: `2df57da` — 15 files, +1964 insertions.
+- **W4 완료 (Risk 계층, 단일 세션 전 구간)**:
+    - `risk/exceptions.py` — `RiskBlocked(code, detail)` 단일 예외. code는 머신 태그(`circuit_breaker`/`daily_loss_limit`/`market_halt`/`blacklist`/`liquidity`/`symbol_state`/`cooldown`/`sizing`/`symbol_halted`).
+    - `risk/blacklist.py` — `StaticBlacklist` DI 공급자 + `BlacklistEntry`(관리/경고/주의/위험/정지/상장폐지실질심사/SPAC/ETN/우선주 상수). `check_liquidity` (시총 < 500억 또는 거래대금 < 10억 → 실패, 데이터 누락 시 fail-closed).
+    - `risk/market_state.py` — `MarketState`(kospi_change_pct, vi_active, price_change_pct, gap_open_pct, halted). `can_trade_today`(KOSPI ≤ -3% 차단), `can_enter_symbol`(정지/VI/±25%/갭5%+ 차단), `can_exit_symbol`(정지만 차단 — DL/CB 상태에서도 기존 포지션 **청산은 허용**).
+    - `risk/sizing.py` — `SizingPolicy`(per_symbol 20%, per_sector 40%, target_count 5, kelly 1/4), `compute_max_additional_notional` (sector_map 있을 때 섹터 헤드룸까지 min), `compute_equal_weight_notional`, `compute_kelly_notional`(p/b 기반 fractional Kelly), `resolve_quantity`(lot 정렬).
+    - `risk/limits.py` — `DailyLossState.loss_pct`(start_equity=D7 09:00 값 기준), `CircuitBreakerState.evaluate`(연속 3일 손실 or 누적 -10% 자동 triggered), `CooldownPolicy`(재매수 3일/손절 후 재진입 10일), `check_cooldown`이 영업일만 카운트(공휴일 캘린더 W6+), `RiskEngine.check_buy` 9단계 게이트(CB → DL → KOSPI → 블랙리스트 → 유동성 → 심볼상태 → 쿨다운 → 사이징 헤드룸 → 의도 금액), `check_sell`은 정지 종목만 차단, **D14 구현 `@risk_gate` 데코레이터 + `set_risk_engine`/`get_risk_engine` ContextVar API** — 엔진 미설치 시 `RuntimeError`로 fail-loud, `symbol`/`side` kwarg 강제, BUY는 `buy_context: BuyContext` 필수.
+    - **W4 Gate 달성**: 82/82 pass, **risk/* 커버리지 100%**. 전체 누적 177/177 pass.
+    - **설계 의도**: 매수 경로는 9중 관문이 모두 통과해야 호출 진입, 매도 경로는 청산 차단 사유를 최소화하여 리스크 저감 경로를 보존. `@risk_gate` 우회 불가(엔진 미설치 시 호출 자체가 예외).
 
 ## Notes
 
