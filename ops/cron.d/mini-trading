@@ -1,0 +1,26 @@
+# ============================================================
+# mini-trading — 부가 작업 (백업·로그 퍼지·헬스체크)
+# 데몬 생명주기는 systemd 가 담당 (mini-trading*.timer)
+# 설치: scripts/install-crontab.sh (사용자 crontab 에 추가)
+# ============================================================
+
+SHELL=/bin/bash
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+MAILTO=""
+PROJECT_ROOT=/home/mycom/workspace/mini_project
+
+# ── 일별 백업 ──────────────────────────────────────────────
+
+# 03:00  30일 이상 경과 로그 삭제 (runbook §6 hot 30일)
+0 3 * * *   find $PROJECT_ROOT/logs -type f \( -name '*.log' -o -name '*.log.*' -o -name '*.err' \) -mtime +30 -delete 2>/dev/null
+
+# 03:30  SQLite DB 백업 (runbook H3 #5)
+30 3 * * *  /usr/bin/sqlite3 $PROJECT_ROOT/trading.db ".backup '$PROJECT_ROOT/logs/trading.db.$(date +\%Y\%m\%d).bak'" 2>/dev/null
+
+# 일요일 04:00  7일 이상 경과 DB 백업 삭제
+0 4 * * 0   find $PROJECT_ROOT/logs -name 'trading.db.*.bak' -mtime +7 -delete 2>/dev/null
+
+# ── 헬스체크 (옵션) ────────────────────────────────────────
+# 거래시간(09~15) 평일 15분 간격 — 데몬 다운 시 systemctl 로 감지하고 syslog 만 남김.
+# Discord 알림은 데몬 내부 monitoring 으로 보강 권장.
+#*/15 9-15 * * 1-5  systemctl is-active --quiet mini-trading || logger -t mini-trading "WARN: daemon is not active"

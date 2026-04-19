@@ -1,0 +1,7 @@
+[Unit]
+Description=Stop mini-trading daemon (oneshot)
+Documentation=file:///home/mycom/workspace/mini_project/docs/scheduling.md
+
+[Service]
+Type=oneshot
+ExecStart=/bin/systemctl stop mini-trading.service

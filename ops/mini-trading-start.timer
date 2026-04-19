@@ -1,0 +1,18 @@
+[Unit]
+Description=Start mini-trading daemon Mon-Fri 07:00 KST
+Documentation=file:///home/mycom/workspace/mini_project/docs/scheduling.md
+
+[Timer]
+# 평일 07:00 — APScheduler 가 07:30 master 갱신부터 진행할 수 있도록 30분 여유
+OnCalendar=Mon..Fri 07:00 Asia/Seoul
+
+# Persistent: 서버가 다운되어 트리거를 놓쳤어도 부팅 후 즉시 실행
+Persistent=true
+
+# 정확도: ±5초 이내 시작
+AccuracySec=5s
+
+Unit=mini-trading.service
+
+[Install]
+WantedBy=timers.target

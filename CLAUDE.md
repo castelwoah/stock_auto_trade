@@ -94,8 +94,19 @@ mini_project/
 │   │   └── fixtures/metrics_snapshot.json  # W7 회귀 검증 기준
 │   ├── execution/          # 35개 테스트 (portfolio 10 + reconciler 10 + order_manager 10 + pipeline 5) — 커버리지 93%
 │   └── scheduler/          # 37개 테스트 (calendar 19 + watchlist 8 + app 4 + data loader 등) — 커버리지 88%
-├── docs/                   # W8 신설
-│   └── runbook.md          # 장애 플레이북 7 시나리오 (토큰/네트워크/Reconciler/CB/Daily Loss/주문/비정상종료)
+├── docs/                   # W8+ 신설
+│   ├── runbook.md          # 장애 플레이북 7 시나리오 (토큰/네트워크/Reconciler/CB/Daily Loss/주문/비정상종료)
+│   └── scheduling.md       # 운영 가이드 (systemd + crontab 하이브리드, Phase 전환 절차)
+├── ops/                    # 인프라 설정 (systemd 유닛 + crontab 본체) — Phase 3~5 불변
+│   ├── mini-trading.service          # 데몬 (Restart=on-failure, ProtectHome 등 보안 옵션)
+│   ├── mini-trading-start.timer      # Mon-Fri 07:00 KST + Persistent=true (missed trigger 보상)
+│   ├── mini-trading-stop.timer       # Mon-Fri 17:00 KST
+│   ├── mini-trading-stop.service     # oneshot stop
+│   └── cron.d/mini-trading           # 부가 작업 (DB 백업·로그 퍼지·헬스체크 옵션)
+├── scripts/                # 운영 자동화 쉘 스크립트
+│   ├── install-systemd.sh  # sudo bash — 유닛 4개 cp + daemon-reload + enable --now (멱등)
+│   ├── install-crontab.sh  # 사용자 crontab 에 mini-trading 블록 append (멱등)
+│   └── uninstall.sh        # 전체 제거
 └── .claude/
     └── project-rules.md    # 자동매매 에이전트 시스템 프롬프트 v2.0 (차기 설계 방향성)
 ```
@@ -395,6 +406,21 @@ W8 (모의투자)   → 단일 세션 (관찰·튜닝)
     - **W8 Gate 달성**: 73/73 pass (portfolio 10 / reconciler 10 / order_manager 10 / pipeline 5 / calendar 19 / watchlist 8 / app 4), execution/* 커버리지 **93%** / scheduler/* **88%** (APScheduler start/shutdown 실행 경로는 설계상 제외). main 엔트리포인트 dry-run 정상 (`--dry-run` 으로 6 jobs 등록 확인).
     - **전체 누적**: **416/416 pass** (W1~W8).
     - **다음 단계**: Phase 2/3 실주행 — 1) `python3 -m src.main --init-db` 로 DB 생성, 2) KIS PAPER 환경에서 3영업일 dry-run, 3) 4주 paper 관찰 개시. W7 확장(3년 실 데이터·walk-forward)은 Week 2 이후 병행.
+- **인프라 스케줄링 — systemd + crontab 하이브리드 (Ubuntu, sudo)**:
+    - 결정: APScheduler 가 데몬 내부 6개 job(07:30~16:00)을 담당하므로 systemd/cron 의 역할은 "데몬 생명주기 + 부가 작업"으로 분리. **Phase 3 → 5 전 기간 인프라 설정 변경 불필요** 가 핵심 목표.
+    - **systemd (4개 유닛, `ops/`)**:
+      * `mini-trading.service` — 데몬, `Restart=on-failure` (Phase 4 실자본 단계 핵심), `ProtectHome=read-only` + `ReadWritePaths` 보안 옵션, `Environment="TZ=Asia/Seoul"`.
+      * `mini-trading-start.timer` — `OnCalendar=Mon..Fri 07:00 Asia/Seoul`, **`Persistent=true`** 로 missed trigger 보상 (재부팅 후 자동 복구).
+      * `mini-trading-stop.timer` + `mini-trading-stop.service` — 17:00 oneshot stop.
+    - **crontab (`ops/cron.d/mini-trading`)** — 부가 작업만:
+      * 03:00 30일+ 로그 삭제, 03:30 SQLite DB 백업, 일 04:00 7일+ 백업 삭제.
+      * 헬스체크 `*/15 9-15 * * 1-5` 는 주석으로 옵션 제공.
+    - **설치 자동화 (`scripts/`)**:
+      * `install-systemd.sh` (sudo) — 유닛 4개 cp + daemon-reload + enable --now. 멱등.
+      * `install-crontab.sh` (user) — 기존 mini-trading 블록 sed 제거 후 append. 멱등.
+      * `uninstall.sh` (sudo) — 전체 제거.
+    - **운영 가이드 `docs/scheduling.md`**: 11 섹션 — 설치, 일상 운영(systemctl/journalctl), 타임라인, Phase 전환 절차(인프라 불변), 장애 대응, FAQ, 점검 체크리스트.
+    - **Phase 전환 시 변경 대상**: `config.yaml` (KIS_ENV) + 데몬 재시작 (`sudo systemctl restart mini-trading`) **만**. systemd 유닛·crontab·코드는 불변.
 
 ## Notes
 

@@ -1,0 +1,45 @@
+[Unit]
+Description=KIS Auto-Trading Daemon (mini-trading)
+Documentation=file:///home/mycom/workspace/mini_project/docs/scheduling.md
+Documentation=file:///home/mycom/workspace/mini_project/docs/runbook.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=mycom
+Group=mycom
+WorkingDirectory=/home/mycom/workspace/mini_project
+
+# PATH 는 Python 실행 파일 위치 우선. conda 환경 사용 중.
+Environment="PATH=/home/mycom/miniconda3/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+Environment="PYTHONUNBUFFERED=1"
+Environment="TZ=Asia/Seoul"
+
+# 설정 우선순위 (D10): ENV > .env > config.yaml. 필요 시 ENV 로 오버라이드.
+# Environment="KIS_ENV=PAPER"
+
+ExecStart=/home/mycom/miniconda3/bin/python3 -m src.main
+
+# 크래시 시 자동 복구 (Phase 4 실자본 단계의 핵심)
+Restart=on-failure
+RestartSec=30
+
+# graceful shutdown — main.py 의 SIGINT/SIGTERM 핸들러가 받음
+KillSignal=SIGTERM
+TimeoutStopSec=60
+
+# 로그 — journald 로 통합 (journalctl -u mini-trading) + 파일에도 append
+StandardOutput=append:/home/mycom/workspace/mini_project/logs/main.log
+StandardError=append:/home/mycom/workspace/mini_project/logs/main.err
+SyslogIdentifier=mini-trading
+
+# 보안 강화 (rules §11.1 권장)
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=read-only
+ReadWritePaths=/home/mycom/workspace/mini_project
+
+[Install]
+WantedBy=multi-user.target

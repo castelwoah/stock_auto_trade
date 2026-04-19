@@ -1,0 +1,17 @@
+[Unit]
+Description=Stop mini-trading daemon Mon-Fri 17:00 KST
+Documentation=file:///home/mycom/workspace/mini_project/docs/scheduling.md
+
+[Timer]
+# 평일 17:00 — 16:00 일일 리포트 + 마무리 작업 후 종료
+OnCalendar=Mon..Fri 17:00 Asia/Seoul
+
+# 종료 트리거는 보상 불필요 (놓쳤으면 그날은 어차피 끝)
+Persistent=false
+
+AccuracySec=5s
+
+Unit=mini-trading-stop.service
+
+[Install]
+WantedBy=timers.target
