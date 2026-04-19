@@ -8,7 +8,7 @@
 ## Tech Stack
 
 - **Language**: Python 3.10 (dev) / **3.11+ 목표** (rules)
-- **Dependencies**: `requirements.txt` — requests, PyYAML, pydantic, pydantic-settings, SQLAlchemy / dev: pytest (pandas는 legacy만 사용)
+- **Dependencies**: `requirements.txt` — requests, PyYAML, pydantic, pydantic-settings, SQLAlchemy, **APScheduler** / dev: pytest, pytest-cov (pandas는 legacy만 사용)
 - **External API**: 한국투자증권 Open Trading API (`openapi.koreainvestment.com:9443`)
 - **Notification**: Discord Webhook
 
@@ -71,6 +71,16 @@ mini_project/
 │   │   ├── engine.py        # bar-by-bar 루프, risk_engine 의존 주입, Registry + sim + loader 통합
 │   │   ├── data_loader.py   # BacktestDataLoader ABC + SyntheticDataLoader(seed) + CsvDataLoader + D5 60초 필터 (단일 위치)
 │   │   └── metrics.py       # Sharpe(252) / MDD / Win rate / PF(999 sentinel) / CAGR / Alpha + snapshot fixture
+│   ├── execution/          # W8 신설 (reconciler · order_manager 는 서브에이전트 금지 영역)
+│   │   ├── portfolio.py     # LivePortfolio (DB Position ↔ StrategyContext, Trade 멱등 INSERT, highest_price D3 영속)
+│   │   ├── reconciler.py    # KIS × DB 교차검증, 3회 연속 불일치 → trading_off + RiskEvent 기록 (D6)
+│   │   ├── order_manager.py # 지정가 IOC, 3분 타임아웃 → 1호가 상향 재시도, 15:00 cut-off / 15:15 일괄 취소
+│   │   └── pipeline.py      # tick 체인: Registry → Risk → Order (trading_off 하드게이트)
+│   ├── scheduler/          # W8 신설
+│   │   ├── calendar.py      # KRX 2026 휴장일 (Agent), is_business_day / next·prev / business_days_between
+│   │   ├── watchlist.py     # 30종목 초기 watchlist (legacy 12 + KOSPI 10 + KOSDAQ 8, 블랙리스트 제외)
+│   │   └── app.py           # APScheduler wrapper — 영업일 게이트 / misfire 300s / cron + interval 헬퍼
+│   ├── main.py             # W8 엔트리포인트 — config→clients→scheduler wire-up, SIGINT/SIGTERM graceful shutdown
 │   └── persistence/        # W2 신설
 │       ├── db.py           # SQLAlchemy engine/session, session_scope, init_db
 │       └── models.py       # 8 tables: NewsArticle, ArticleSymbol, StockScore, Trade(idem UNIQUE), Position(symbol+strategy_id PK), RiskEvent, DailyPnl, CashFlow
@@ -80,8 +90,12 @@ mini_project/
 │   ├── risk/               # 82개 테스트 (blacklist 9 + market 12 + sizing 19 + limits 20 + engine 22) — 커버리지 100%
 │   ├── strategy/           # 75개 테스트 (base 4 + exit 21 + breakout 12 + registry 12 + news_swing 18 + integration 8) — 커버리지 99%
 │   ├── reporting/          # 40개 테스트 (daily 14 + intraday 11 + archiver 15) — 커버리지 97%
-│   └── backtest/           # 51개 테스트 (portfolio 18 + metrics 11 + data_loader 13 + engine integration 9) — 커버리지 94%
-│       └── fixtures/metrics_snapshot.json  # W7 회귀 검증 기준
+│   ├── backtest/           # 51개 테스트 (portfolio 18 + metrics 11 + data_loader 13 + engine integration 9) — 커버리지 94%
+│   │   └── fixtures/metrics_snapshot.json  # W7 회귀 검증 기준
+│   ├── execution/          # 35개 테스트 (portfolio 10 + reconciler 10 + order_manager 10 + pipeline 5) — 커버리지 93%
+│   └── scheduler/          # 37개 테스트 (calendar 19 + watchlist 8 + app 4 + data loader 등) — 커버리지 88%
+├── docs/                   # W8 신설
+│   └── runbook.md          # 장애 플레이북 7 시나리오 (토큰/네트워크/Reconciler/CB/Daily Loss/주문/비정상종료)
 └── .claude/
     └── project-rules.md    # 자동매매 에이전트 시스템 프롬프트 v2.0 (차기 설계 방향성)
 ```
@@ -364,6 +378,23 @@ W8 (모의투자)   → 단일 세션 (관찰·튜닝)
     - **Trust-but-verify 통합 이슈 1건 해결**: engine 은 직전 영업일 close 필요 → 테스트 로더 범위를 시작일보다 7일 앞으로 확장 (실 데이터에서는 히스토리 자연 확보).
     - **W7 린 Gate 달성**: **51/51 pass** (portfolio 18 + metrics 11 + data_loader 13 + engine integration 9), `backtest/*` 커버리지 **94%** (Gate 85% 초과). Sharpe/MDD/PF 수학적 정확성 snapshot fixture 로 회귀 보장. **수치 Sharpe > 1.0 게이트는 W7 확장 실 데이터로 사후 충족 예정**.
     - **전체 누적**: **343/343 pass** (ingestion 27 + analysis 68 + risk 82 + strategy 75 + reporting 40 + backtest 51).
+- **W7 린 커밋**: `0c46a3f` — 12 files, +2089 insertions.
+- **W8 완료 (Execution + Scheduler + Runbook, 메인 4개 + Agent×2)**:
+    - 메인 (금지 영역 2개 포함):
+      * `execution/portfolio.py` — `LivePortfolio` DB-backed. `record_trade`(idempotency_key 멱등), `apply_fill_to_position`(BUY 가중평균 / SELL 수량 차감), `update_highest_price`(D3 이벤트 드리븐 WRITE), `mark_halt`, `equity()`.
+      * `execution/reconciler.py` — **금지 영역**. `verify()`는 symbol 단위로 KIS×DB 비교(같은 symbol 을 여러 전략이 보유 가능 → 총합 비교). `verify_with_grace()`는 1분 유예 × 3회 재시도. 3회 연속 불일치 시 `trading_off_required()=True`. 불일치마다 `RiskEvent(event_type="reconcile_mismatch")` INSERT — **rules §4.2 스키마 변경 금지 준수** (신규 테이블 X, RiskEvent 재사용).
+      * `execution/order_manager.py` — **금지 영역**. `submit` 은 지정가 주문(ORD_DVSN=00), idempotency_key 로 Trade 사전 기록, KIS 실패 시 status='rejected'. `poll()` 은 3분 타임아웃 → 1호가 상향(≈0.5%) 재시도 최대 2회 후 cancel + notify. **15:00 이후 BUY 차단 / 15:15 EOD 일괄 취소 (M5)**. dict iteration size-change bug 발견·수정 (Trust-but-verify 성과).
+      * `execution/pipeline.py` — `TradingPipeline` tick 단위 체인. `run_tick`: pending poll → trading_off 체크 → Registry → @risk_gate 대응(check_buy/sell) → `order_manager.submit`. `trading_off` 플래그 + reconciler 상태 OR 결합.
+      * `scheduler/watchlist.py` — legacy 12 + KOSPI 상위 10 + KOSDAQ 상위 8 = **30종목 제한** (v2 C6), 블랙리스트 자동 제외, `max_size` 파라미터.
+      * `scheduler/app.py` — `TradingScheduler`(APScheduler BackgroundScheduler, KST), `misfire_grace_time=300s` (v2 H4), 영업일 gate 래퍼, `register_default_jobs` 로 6개 job 자동 등록(07:30 master / 08:00 news / 08:30 score / 09:00 state / 09:10~15:20 tick / 16:00 report).
+      * `main.py` — 엔트리포인트: `--init-db` / `--dry-run` / 정상 가동. SIGINT/SIGTERM 핸들러로 graceful shutdown (H3 #8). dry-run 실측: 6 jobs 정상 등록.
+    - 서브에이전트 Agent×2 병렬:
+      * `scheduler/calendar.py` — KRX 2026 휴장일 18개 frozenset (신정·설·삼일절·어린이날·석탄일·현충일·광복절·추석·개천절·한글날·기독탄신일·대체공휴일·연말). `is_business_day`/`next`/`prev`/`business_days_between`. 2027+ 는 확장 가이드 포함. 19 테스트 통과.
+      * `docs/runbook.md` — 7 시나리오 플레이북: 토큰 만료, 네트워크 단절, Reconciler 불일치, Circuit Breaker, Daily Loss Limit, 주문 미체결, 비정상 종료. 각 시나리오 4단계(징후→즉시 조치→복구→사후). Secret 관리 / 로그 보존 / 자본 확대 게이트 포함. Agent 제안 추가: "휴장일 sync 실패" + "KIS API 장애" 별도 분리 시나리오 (향후 보강 후보).
+    - **Trust-but-verify 수확**: poll() 의 dict iteration size-change 버그를 통합 테스트 중 발견 → `list(pending.items())` + `to_remove` 후처리로 수정.
+    - **W8 Gate 달성**: 73/73 pass (portfolio 10 / reconciler 10 / order_manager 10 / pipeline 5 / calendar 19 / watchlist 8 / app 4), execution/* 커버리지 **93%** / scheduler/* **88%** (APScheduler start/shutdown 실행 경로는 설계상 제외). main 엔트리포인트 dry-run 정상 (`--dry-run` 으로 6 jobs 등록 확인).
+    - **전체 누적**: **416/416 pass** (W1~W8).
+    - **다음 단계**: Phase 2/3 실주행 — 1) `python3 -m src.main --init-db` 로 DB 생성, 2) KIS PAPER 환경에서 3영업일 dry-run, 3) 4주 paper 관찰 개시. W7 확장(3년 실 데이터·walk-forward)은 Week 2 이후 병행.
 
 ## Notes
 

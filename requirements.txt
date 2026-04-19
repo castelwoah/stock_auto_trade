@@ -3,6 +3,8 @@ PyYAML>=6.0
 pydantic>=2.7
 pydantic-settings>=2.5
 SQLAlchemy>=2.0
+APScheduler>=3.10
 
 # dev / test
 pytest>=8.0
+pytest-cov>=7.0
