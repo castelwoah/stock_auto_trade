@@ -41,11 +41,20 @@ mini_project/
 │   │       ├── yonhap_rss.py          # 연합뉴스 RSS 2.0 (stdlib XML, 실구현)
 │   │       ├── naver_disclosure.py    # 스캐폴드 (TODO: HTML 실구현 + 법무)
 │   │       └── kis_news.py            # 스캐폴드 (TODO: KIS TR_ID 확정)
+│   ├── analysis/           # W3 신설
+│   │   ├── contracts.py    # FactorScore dataclass + clip_score / linear_map
+│   │   ├── sentiment.py    # 룰 v1 (긍정 23 / 부정 24 키워드, 부정어 양방향 ±15자)
+│   │   ├── news.py         # 심볼별 기사 집계, 시간 감쇠(48h half-life), D5 look-ahead 필터
+│   │   ├── scorer.py       # 가중합(news30/fin25/tech25/flow20), CANDIDATE_THRESHOLD=70, D12 메타
+│   │   ├── technical.py    # RSI14 Wilder + MA5/20/60 + MACD (3봉 cross 창, eps 1e-9)
+│   │   ├── financial.py    # 부채비율·ROE·영업이익률·OCF, 균등 평균
+│   │   └── flow.py         # 외국인·기관 5d 순매수, 5d/60d 거래량비 (market_cap 정규화)
 │   └── persistence/        # W2 신설
 │       ├── db.py           # SQLAlchemy engine/session, session_scope, init_db
 │       └── models.py       # 8 tables: NewsArticle, ArticleSymbol, StockScore, Trade(idem UNIQUE), Position(symbol+strategy_id PK), RiskEvent, DailyPnl, CashFlow
-├── tests/                  # W2 신설
-│   └── ingestion/          # 27개 테스트 (dart 7 + yonhap 9 + naver 6 + kis 5)
+├── tests/                  # W2·W3 확장
+│   ├── ingestion/          # 27개 테스트 (dart 7 + yonhap 9 + naver 6 + kis 5)
+│   └── analysis/           # 68개 테스트 (scorer/news/sentiment 22 + tech 15 + fin 15 + flow 12 + integration 4)
 └── .claude/
     └── project-rules.md    # 자동매매 에이전트 시스템 프롬프트 v2.0 (차기 설계 방향성)
 ```
@@ -271,6 +280,20 @@ W8 (모의투자)   → 단일 세션 (관찰·튜닝)
     - **전체 테스트 27/27 pass** (pytest 9.0.3).
     - **W2 Gate 상태**: 계약·DB·2개 실구현 + 2개 스캐폴드 확보. "7일간 수집 이상 無" 실주행 검증은 Phase 1 후반(스케줄러 가동 시)에 수행.
     - **requirements.txt**에 `SQLAlchemy>=2.0`, `pytest>=8.0` 추가.
+- **W2 커밋**: `5ad6b5a` — 21 files, +1672 insertions.
+
+### 2026-04-19
+- **W3 완료 (Analysis 계층, Agent×3 병렬 적용)**:
+    - 메인 단일 세션: `analysis/contracts.py`(FactorScore 표준 반환형 + clip_score/linear_map), `sentiment.py`(룰 v1, 긍정 23·부정 24 키워드 사전, 부정어 양방향 ±15자 체크, source 가중치 DART 1.0 > KIS 0.9 > Naver 0.85 > Yonhap 0.8), `news.py`(심볼별 집계 + 시간 감쇠 half-life 48h + D5 look-ahead 60초 지연 필터), `scorer.py`(news30/fin25/tech25/flow20 가중합, `CANDIDATE_THRESHOLD=70`, `insufficient_data` 플래그 있으면 50으로 대체 후 candidate 차단, D12 재현성 메타 `scoring_ver + sentiment_model_ver + llm_prompt_hash` 모두 stock_scores row 에 기록).
+    - 서브에이전트 Agent×3 병렬 실행 (97~252초):
+      * `analysis/technical.py` — RSI14 Wilder / MA5·20·60 / MACD(12,26,9), 최근 3봉 cross 창, eps 1e-9로 부동소수 잡음 차단. 15 테스트 통과.
+      * `analysis/financial.py` — 부채비율(50/200) · ROE(0/20) · 영업이익률(0/20) · OCF/매출(0/15) 각 sub-score 후 균등 평균. 15 테스트 통과.
+      * `analysis/flow.py` — 외국인·기관 5d 순매수 (market_cap 있으면 ±1% 스케일, 없으면 ±100억 절대 스케일 폴백) + 5d/60d 거래량비 (1.5~3.0 가점, 3.0 초과 과열 감점). 12 테스트 통과.
+    - **Technical 모듈 결함 2건 수정 (Trust-but-verify 성공 사례)**:
+      1. 선형 시계열에서 부동소수 잡음으로 histogram 부호가 미세 음수가 되어 중립 구간도 감점 → `eps=1e-9` 도입.
+      2. MACD cross 검출이 최종 1봉에만 작동해 실제 signal 놓침 → 최근 3봉 창 내 스캔으로 확장.
+    - **W3 Gate 달성**: 스코어링 100종목 < 10초 (실측 수십 ms). 전체 테스트 **95/95 pass** (W1·W2·W3 누적).
+    - **통합 테스트 4건**: 이상적 종목(뉴스 호재+정배열+우량재무+수급유입) → candidate 편입 확인, 악재 종목 → threshold 미달, technical insufficient → candidacy 차단, DB row에 재현성 필드 모두 포함.
 
 ## Notes
 
