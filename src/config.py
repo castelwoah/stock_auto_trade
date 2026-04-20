@@ -37,6 +37,7 @@ class Settings(BaseSettings):
         default_factory=lambda: f"sqlite:///{PROJECT_ROOT / 'trading.db'}"
     )
     DART_API_KEY: SecretStr | None = None
+    ARCHIVE_ROOT: Path = Field(default_factory=lambda: PROJECT_ROOT / "reports")
 
     model_config = SettingsConfigDict(
         env_file=str(PROJECT_ROOT / ".env"),

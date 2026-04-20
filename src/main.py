@@ -22,10 +22,16 @@ import threading
 import time
 from datetime import datetime
 
+from datetime import date
+
 from src.clients.discord import DiscordNotifier
 from src.clients.kis import KisClient
 from src.config import get_settings
 from src.persistence.db import init_db, session_scope
+from src.reporting.archiver import Archiver
+from src.reporting.builders import build_daily_report, build_midday_snapshot
+from src.reporting.daily_report import send_daily_report
+from src.reporting.midday_report import in_valid_window, send_midday_report
 from src.scheduler.app import TradingScheduler, register_default_jobs
 
 
@@ -61,17 +67,41 @@ def _make_job_handlers(settings, kis, notifier):
         logging.info("[job] trading_tick at %s", datetime.now().time())
 
     def midday_report():
-        # v3 방어 윈도우 체크 (11:55 ~ 12:15 외 호출은 skip)
-        from src.reporting.midday_report import in_valid_window
         now = datetime.now()
         if not in_valid_window(now):
             logging.warning("[job] midday_report out of window (%s), skipping", now.time())
             return
-        logging.info("[job] midday_report — 장중 스냅샷 전송 (stub)")
-        # Phase 3 보강: session_scope() + build_midday_snapshot + send_midday_report
+        logging.info("[job] midday_report — 장중 스냅샷 생성 중")
+        try:
+            with session_scope() as session:
+                snap = build_midday_snapshot(session, ts=now)
+                send_midday_report(notifier, snap)
+            logging.info("midday snapshot sent (%d positions, %d candidates, %d anomalies)",
+                         len(snap.positions), len(snap.top_candidates), len(snap.anomalies))
+        except Exception:
+            logging.exception("midday_report failed")
+            notifier.send(f"[main] midday_report 실패: {datetime.now().isoformat()}")
 
     def daily_report():
-        logging.info("[job] daily_report (stub) — Discord + archiver")
+        today = date.today()
+        logging.info("[job] daily_report for %s", today)
+        try:
+            archiver = Archiver(settings.ARCHIVE_ROOT)
+            with session_scope() as session:
+                report = build_daily_report(session, report_date=today)
+                send_daily_report(notifier, report)
+                archiver.write_daily_report(report)
+                archiver.write_trades_csv(report)
+                archiver.append_tax_ledger(report)
+            logging.info(
+                "daily report: buys=%d tp=%d sl=%d rej=%d cxl=%d risk=%d",
+                len(report.trades.buys), len(report.trades.take_profits),
+                len(report.trades.stop_losses), report.trades.rejection_count,
+                report.trades.cancellation_count, report.trades.risk_block_count,
+            )
+        except Exception:
+            logging.exception("daily_report failed")
+            notifier.send(f"[main] daily_report 실패: {datetime.now().isoformat()}")
 
     return {
         "master_refresh": master_refresh,

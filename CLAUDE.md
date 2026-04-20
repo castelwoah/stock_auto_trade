@@ -66,6 +66,7 @@ mini_project/
 │   │   ├── daily_report.py  # render_text (rules §7.1 + v3 실패·차단 섹션) + render_embed (색상 분기)
 │   │   ├── midday_report.py # v3 신설 — 12:00 장중 스냅샷, anomaly 탐지, 방어 윈도우(11:55~12:15)
 │   │   ├── pnl_calc.py      # v3 신설 — FIFO BUY↔SELL 매칭, 비용 반영 (스키마 무변경)
+│   │   ├── builders.py      # v3.1 신설 — DB 조회 기반 build_daily_report / build_midday_snapshot
 │   │   ├── intraday.py      # 체결·리스크 즉시 Embed + notify_* helpers
 │   │   └── archiver.py      # 일별 JSON + trades CSV + 연간 세금 CSV
 │   ├── backtest/           # W7 린 신설 (v2)
@@ -450,6 +451,27 @@ W8 (모의투자)   → 단일 세션 (관찰·튜닝)
       * RiskEvent 재사용 (event_type='risk_blocked' / 'reconcile_mismatch').
       * intraday Discord 과다 방지 → 실패·차단은 daily/midday 집계로만 전달.
     - **다음 단계 (Phase 3 실주행 시 추가 실구현)**: handler 들의 실 DB/KIS 데이터 수집 (현재 stub). `build_midday_snapshot(session, kis)` 함수, `build_daily_report(session, kis)` 함수 추가 필요.
+- **v3.1 Phase 3 handler 실구현** (2026-04-21):
+    - 배경: v3 에서 리포트 렌더 함수는 완성됐으나 실제 DB 조회·조립 로직이 없어 handler 가 여전히 stub. Paper trading 시작 전 **daily/midday 자동 전송** 이 동작하도록 실구현.
+    - `reporting/builders.py` 신설:
+      * `build_daily_report(session, *, report_date, market?, portfolio?, risk?, ...)` — DB 기반(Trade/RiskEvent/NewsArticle/StockScore 조회), 런타임 상태(market/portfolio/risk)는 주입.
+      * `build_midday_snapshot(session, *, ts, current_prices?, ...)` — 오전(09:10~12:00) window 필터, 포지션별 미실현 P&L, top-5 candidates, anomaly 자동 탐지.
+      * `_classify_trades()` — Trade.status 별로 buys/TP/SL/rejections/cancellations 자동 분류. FIFO 매칭은 기존 `pnl_calc.compute_realized_pnl` 재사용.
+      * `_dominant_factor()` — StockScore 4개 sub-score 에 가중치(30/25/25/20) 적용 후 최대 팩터 선택.
+    - `main.py` handler 실구현:
+      * `daily_report` handler: Archiver(settings.ARCHIVE_ROOT) + session_scope() + build + send + 3종 아카이브(JSON/trades CSV/세금 CSV) 일괄.
+      * `midday_report` handler: 방어 윈도우 11:55~12:15 체크 → build_midday_snapshot → send_midday_report. 예외 시 Discord 경고만 보내고 프로세스 유지.
+      * 에러 격리: builder/archiver 예외가 스케줄러 전체를 죽이지 않음.
+    - `Settings.ARCHIVE_ROOT` 필드 추가 (기본 `PROJECT_ROOT/reports`), `.gitignore` 에 logs/reports 이미 포함.
+    - **v3.1 Gate 달성**: 18 builder 테스트 추가, 전체 **477/477 pass**. dry-run 7 jobs 정상.
+    - **미완 항목 (Paper 실주행 중 점진 보강)**:
+      * `master_refresh` handler: `kospi/kosdaq_code.mst` 재다운로드 (D9)
+      * `news_collect` handler: DART + Yonhap 스크래퍼 호출
+      * `analyze_score` handler: 팩터 계산 + StockScore INSERT
+      * `prepare_state` handler: reconciler.verify_with_grace() + RiskEngine.daily_loss 리프레시
+      * `trading_tick` handler: TradingPipeline.run_tick() 호출
+      * KIS 시장 지수(KOSPI/KOSDAQ) 조회 — 별도 TR_ID 필요
+      * builder 에 portfolio/risk 주입 (RiskEngine ContextVar 구독)
 
 ## Notes
 
