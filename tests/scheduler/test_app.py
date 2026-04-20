@@ -5,7 +5,8 @@ from unittest.mock import MagicMock
 from src.scheduler.app import TradingScheduler, register_default_jobs
 
 
-def test_register_default_jobs_adds_six():
+def test_register_default_jobs_adds_seven():
+    """v3: midday_report 추가되어 7개."""
     sched = TradingScheduler()
     jobs = register_default_jobs(
         sched,
@@ -14,13 +15,30 @@ def test_register_default_jobs_adds_six():
         analyze_score=MagicMock(),
         prepare_state=MagicMock(),
         trading_tick=MagicMock(),
+        midday_report=MagicMock(),
         daily_report=MagicMock(),
     )
     assert set(jobs.keys()) == {
         "master_refresh", "news_collect", "analyze_score",
-        "prepare_state", "trading_tick", "daily_report",
+        "prepare_state", "trading_tick", "midday_report", "daily_report",
     }
-    assert len(sched.scheduler.get_jobs()) == 6
+    assert len(sched.scheduler.get_jobs()) == 7
+
+
+def test_midday_report_job_at_12_00():
+    sched = TradingScheduler()
+    register_default_jobs(
+        sched,
+        master_refresh=MagicMock(),
+        news_collect=MagicMock(),
+        analyze_score=MagicMock(),
+        prepare_state=MagicMock(),
+        trading_tick=MagicMock(),
+        midday_report=MagicMock(),
+        daily_report=MagicMock(),
+    )
+    job = sched.scheduler.get_job("midday_report")
+    assert job is not None
 
 
 def test_add_cron_sets_business_day_wrapper():

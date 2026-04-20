@@ -20,8 +20,11 @@ from dataclasses import dataclass, field
 from datetime import datetime, time, timedelta
 from typing import Callable
 
+from sqlalchemy import update as sa_update
+
 from src.clients.kis import KisClient
 from src.execution.portfolio import LivePortfolio, TradeRecord
+from src.persistence.models import Trade
 from src.reporting.intraday import notify_risk_event
 from src.clients.discord import DiscordNotifier
 from src.strategy.base import Action, Signal
@@ -36,6 +39,14 @@ RESUBMIT_AFTER_SECONDS = 180   # 3 min
 ENTRY_CUTOFF = time(15, 0)
 EOD_CANCEL = time(15, 15)
 TICK_UP_FRACTION = 0.005       # 1호가 근사치 (대형주 ~0.5% 기준, 보수적)
+
+# Trade.status 값 상수 — v3 시도 로그 정규화
+STATUS_SUBMITTED = "submitted"
+STATUS_FILLED = "filled"
+STATUS_REJECTED = "rejected"
+STATUS_CANCELLED_TIMEOUT = "cancelled_timeout"   # 재시도 한계 초과
+STATUS_CANCELLED_EOD = "cancelled_eod"           # 15:15 일괄 취소
+STATUS_CANCELLED_MANUAL = "cancelled_manual"     # 수동 취소 (향후)
 
 
 # Price band helpers — 호가 단위는 종목별로 다르지만 근사치로 처리
@@ -197,11 +208,14 @@ class OrderManager:
             price=fill_price,
             ts=ts or self._now(),
         )
+        # Trade.status 를 filled 로 갱신 (v3 실패·성공 리포트 근거 자료)
+        self._update_trade_status(po.idempotency_key, STATUS_FILLED)
 
-    def mark_cancelled(self, order_id: str) -> None:
+    def mark_cancelled(self, order_id: str, *, status: str = STATUS_CANCELLED_MANUAL) -> None:
         po = self.pending.get(order_id)
         if po is not None:
             po.cancelled = True
+            self._update_trade_status(po.idempotency_key, status)
 
     # ------------------------------------------------------------------
     # Internals
@@ -251,14 +265,33 @@ class OrderManager:
             except Exception:
                 logger.exception("cancel hook failed for %s", po.order_id)
         po.cancelled = True
-        if self.notifier is not None:
-            notify_risk_event(
-                self.notifier,
-                event_type="order_cancelled",
-                symbol=po.signal.symbol,
-                detail=f"{reason}; order_id={po.order_id}",
-                action_taken="order_state_terminated",
+        # Trade.status 갱신 — 리포트용 분류 (v3)
+        status_map = {
+            "max_retries_exceeded": STATUS_CANCELLED_TIMEOUT,
+            "eod_cancel": STATUS_CANCELLED_EOD,
+        }
+        self._update_trade_status(
+            po.idempotency_key, status_map.get(reason, STATUS_CANCELLED_MANUAL)
+        )
+        # NOTE: v3 결정 3-(a) — intraday Discord 알림은 과다 방지 위해 미발송.
+        # 실패·차단은 daily/midday 리포트에서 집계로 전달.
+        logger.info(
+            "order cancelled: %s %s reason=%s", po.signal.symbol, po.order_id, reason
+        )
+
+    def _update_trade_status(self, idempotency_key: str, status: str) -> None:
+        """Trade.status 갱신. 본 OrderManager 는 portfolio 의 session 을 공유."""
+        if not idempotency_key:
+            return
+        try:
+            self.portfolio.session.execute(
+                sa_update(Trade)
+                .where(Trade.idempotency_key == idempotency_key)
+                .values(status=status)
             )
+            self.portfolio.session.flush()
+        except Exception:
+            logger.exception("failed to update Trade.status for %s", idempotency_key)
 
     @staticmethod
     def _extract_order_id(kis_response: dict) -> str:

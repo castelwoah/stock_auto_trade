@@ -118,6 +118,29 @@ def render_text(report: DailyReport) -> str:
         lines.append("  (거래 없음)")
     lines.append("")
 
+    # v3: 실패·차단 섹션 — 시도했으나 성공하지 못한 건들
+    has_failures = bool(t.rejections or t.cancellations or t.risk_blocks)
+    if has_failures:
+        lines.append("■ 실패·차단")
+        if t.rejections:
+            lines.append(f"  - 거절(KIS): {t.rejection_count}건")
+            for a in t.rejections[:5]:   # 과다 출력 방지
+                lines.append(
+                    f"    · {a.ts.strftime('%H:%M')} {a.symbol} {a.action} {a.qty}주: {a.reason_detail or a.reason_code}"
+                )
+            if t.rejection_count > 5:
+                lines.append(f"    ... 외 {t.rejection_count - 5}건")
+        if t.cancellations:
+            cb = t.cancellation_breakdown
+            parts = [f"{code} {cnt}" for code, cnt in sorted(cb.items())]
+            lines.append(f"  - 취소: {t.cancellation_count}건 ({', '.join(parts)})")
+        if t.risk_blocks:
+            # v3 결정 #2: 리스크 차단은 code 별 카운트만
+            rb = t.risk_block_breakdown
+            parts = [f"{code} {cnt}" for code, cnt in sorted(rb.items())]
+            lines.append(f"  - 리스크 차단: {t.risk_block_count}건 ({', '.join(parts)})")
+        lines.append("")
+
     # 리스크 상태
     r = report.risk
     cb_status = (
@@ -215,6 +238,24 @@ def render_embed(report: DailyReport) -> dict[str, Any]:
         ),
         "inline": False,
     })
+    # v3: 실패·차단 요약
+    if t.rejections or t.cancellations or t.risk_blocks:
+        rb_breakdown = t.risk_block_breakdown
+        cb_breakdown = t.cancellation_breakdown
+        lines_fail: list[str] = []
+        if t.rejections:
+            lines_fail.append(f"거절(KIS): {t.rejection_count}건")
+        if t.cancellations:
+            parts = [f"{k} {v}" for k, v in sorted(cb_breakdown.items())]
+            lines_fail.append(f"취소: {t.cancellation_count}건 ({', '.join(parts)})")
+        if t.risk_blocks:
+            parts = [f"{k} {v}" for k, v in sorted(rb_breakdown.items())]
+            lines_fail.append(f"리스크: {t.risk_block_count}건 ({', '.join(parts)})")
+        fields.append({
+            "name": "■ 실패·차단",
+            "value": "\n".join(lines_fail),
+            "inline": False,
+        })
     if report.next_actions:
         fields.append({
             "name": "■ 다음 액션",

@@ -9,10 +9,13 @@ from dataclasses import dataclass, field
 from datetime import date, datetime
 from typing import Callable
 
+from datetime import datetime as _dt
+
 from src.clients.kis import KisClient
 from src.execution.order_manager import OrderManager
 from src.execution.portfolio import LivePortfolio
 from src.execution.reconciler import Reconciler
+from src.persistence.models import RiskEvent
 from src.risk.exceptions import RiskBlocked
 from src.risk.limits import BuyContext, RiskEngine
 from src.risk.sizing import resolve_quantity
@@ -119,7 +122,25 @@ class TradingPipeline:
             return True
         except RiskBlocked as rb:
             logger.info("risk blocked %s %s: %s", sig.action.value, sig.symbol, rb)
+            # v3: RiskEvent 에 기록 — daily/midday 리포트에서 집계
+            # 스키마 재사용 (rules §4.2 준수): event_type='risk_blocked',
+            # action_taken 에 세부 code(blacklist / daily_loss_limit / ...) 저장
+            self._record_risk_block(sig, rb, ctx.as_of)
             return False
+
+    def _record_risk_block(self, sig: Signal, rb: RiskBlocked, ts) -> None:
+        try:
+            event = RiskEvent(
+                ts=ts if isinstance(ts, _dt) else _dt.now(),
+                event_type="risk_blocked",
+                symbol=sig.symbol,
+                detail=f"{sig.action.value} {sig.symbol} @{sig.strategy_id}: {rb.detail}",
+                action_taken=rb.code,
+            )
+            self.portfolio.session.add(event)
+            self.portfolio.session.flush()
+        except Exception:
+            logger.exception("failed to record risk_blocked event for %s", sig.symbol)
 
     def _build_buy_context(self, sig: Signal, ctx: TickContext) -> BuyContext:
         existing: dict[str, float] = {}

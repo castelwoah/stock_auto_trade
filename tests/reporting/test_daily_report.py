@@ -1,4 +1,4 @@
-from datetime import date
+from datetime import date, datetime
 from unittest.mock import MagicMock
 
 from src.reporting.daily_report import (
@@ -11,10 +11,15 @@ from src.reporting.daily_report import (
     send_daily_report,
 )
 from src.reporting.models import (
+    AttemptEntry,
     DailyReport,
     DataCollectionSummary,
     MarketSummary,
     PortfolioState,
+    RESULT_BLOCKED_RISK,
+    RESULT_CANCELLED_EOD,
+    RESULT_CANCELLED_TIMEOUT,
+    RESULT_REJECTED,
     RiskStatus,
     TradeEntry,
     TradeExecutionSummary,
@@ -170,3 +175,121 @@ def test_send_text_mode_uses_plain():
     send_daily_report(notifier, _full_report(), mode="text")
     notifier.send.assert_called_once()
     notifier.send_embed.assert_not_called()
+
+
+# --- v3: 실패·차단 섹션 ---------------------------------------------------
+
+def _with_failures(**trade_kwargs) -> DailyReport:
+    r = _full_report()
+    base = dict(
+        buys=r.trades.buys,
+        take_profits=r.trades.take_profits,
+        stop_losses=r.trades.stop_losses,
+    )
+    base.update(trade_kwargs)
+    # frozen dataclass 이므로 replace 불가 — 새로 구성
+    from dataclasses import replace
+    new_trades = TradeExecutionSummary(**base)
+    return replace(r, trades=new_trades)
+
+
+def test_render_text_includes_failures_section_when_present():
+    r = _with_failures(
+        rejections=[
+            AttemptEntry(
+                ts=datetime(2026, 4, 19, 11, 2),
+                symbol="005930", action="BUY", qty=10, price=75000,
+                result=RESULT_REJECTED, reason_code="rt_cd_1",
+                reason_detail="주문가능시간외",
+            ),
+        ],
+        cancellations=[
+            AttemptEntry(
+                ts=datetime(2026, 4, 19, 10, 45),
+                symbol="035720", action="BUY", qty=5, price=55000,
+                result=RESULT_CANCELLED_TIMEOUT, reason_code="timeout",
+                reason_detail="3분 미체결 × 2회",
+            ),
+        ],
+        risk_blocks=[
+            AttemptEntry(
+                ts=datetime(2026, 4, 19, 11, 15),
+                symbol="123450", action="BUY", qty=10, price=1000,
+                result=RESULT_BLOCKED_RISK, reason_code="blacklist",
+            ),
+            AttemptEntry(
+                ts=datetime(2026, 4, 19, 11, 20),
+                symbol="000660", action="BUY", qty=5, price=120000,
+                result=RESULT_BLOCKED_RISK, reason_code="cooldown",
+            ),
+            AttemptEntry(
+                ts=datetime(2026, 4, 19, 11, 25),
+                symbol="267250", action="BUY", qty=3, price=80000,
+                result=RESULT_BLOCKED_RISK, reason_code="blacklist",
+            ),
+        ],
+    )
+    txt = render_text(r)
+    assert "■ 실패·차단" in txt
+    assert "거절(KIS): 1건" in txt
+    assert "005930" in txt  # 개별 건 출력 확인
+    assert "취소: 1건" in txt and "timeout 1" in txt
+    assert "리스크 차단: 3건" in txt
+    # code 별 카운트: blacklist 2 / cooldown 1 — 순서 알파벳
+    assert "blacklist 2" in txt
+    assert "cooldown 1" in txt
+
+
+def test_render_text_no_failures_omits_section():
+    txt = render_text(_full_report())   # 기본 세팅 = 실패 없음
+    assert "■ 실패·차단" not in txt
+
+
+def test_embed_has_failures_field_when_present():
+    r = _with_failures(
+        risk_blocks=[
+            AttemptEntry(
+                ts=datetime(2026, 4, 19, 11, 15),
+                symbol="X", action="BUY", qty=1, price=100,
+                result=RESULT_BLOCKED_RISK, reason_code="daily_loss_limit",
+            ),
+        ],
+    )
+    emb = render_embed(r)
+    names = [f["name"] for f in emb["fields"]]
+    assert "■ 실패·차단" in names
+
+
+def test_embed_no_failures_field_when_absent():
+    emb = render_embed(_full_report())
+    names = [f["name"] for f in emb["fields"]]
+    assert "■ 실패·차단" not in names
+
+
+def test_risk_block_breakdown_counts_correctly():
+    r = _with_failures(
+        risk_blocks=[
+            AttemptEntry(ts=datetime(2026, 4, 19, 11, 0),
+                         symbol="A", reason_code="blacklist"),
+            AttemptEntry(ts=datetime(2026, 4, 19, 11, 1),
+                         symbol="B", reason_code="blacklist"),
+            AttemptEntry(ts=datetime(2026, 4, 19, 11, 2),
+                         symbol="C", reason_code="cooldown"),
+        ],
+    )
+    assert r.trades.risk_block_breakdown == {"blacklist": 2, "cooldown": 1}
+
+
+def test_truncates_long_rejection_list():
+    """거절 건 6개 → 5건만 상세, 나머지 '외 1건'."""
+    rejections = [
+        AttemptEntry(
+            ts=datetime(2026, 4, 19, 10, i),
+            symbol=f"SYM{i}", action="BUY", qty=1, price=100,
+            result=RESULT_REJECTED, reason_code="x",
+        )
+        for i in range(6)
+    ]
+    r = _with_failures(rejections=rejections)
+    txt = render_text(r)
+    assert "외 1건" in txt

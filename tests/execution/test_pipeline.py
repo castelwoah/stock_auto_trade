@@ -127,3 +127,46 @@ def test_zero_price_skipped(session):
         current_prices={"A": 0},
     )
     assert pipe.run_tick(ctx) == []
+
+
+# --- v3: risk_blocked RiskEvent 기록 ----------------------------------------
+
+def test_risk_blocked_records_risk_event(session):
+    """RiskBlocked 발생 시 RiskEvent(event_type='risk_blocked') 저장되는지."""
+    from src.persistence.models import RiskEvent
+
+    risk = _risk(blacklist=StaticBlacklist.from_iterable([
+        BlacklistEntry(symbol="A", reason=MANAGED)
+    ]))
+    pipe = _pipe(session, risk=risk)
+    ctx = TickContext(
+        as_of=datetime(2026, 4, 20, 10), cash_available=5_000_000,
+        current_prices={"A": 1000},
+    )
+    pipe.run_tick(ctx)
+    session.commit()
+
+    events = session.query(RiskEvent).filter_by(event_type="risk_blocked").all()
+    assert len(events) == 1
+    assert events[0].action_taken == "blacklist"   # RiskBlocked.code
+    assert events[0].symbol == "A"
+    assert "BUY A" in (events[0].detail or "")
+
+
+def test_risk_blocked_reason_code_preserved(session):
+    """code 별로 구분 가능해야 (blacklist vs daily_loss_limit vs cooldown)."""
+    from src.persistence.models import RiskEvent
+
+    # Daily Loss 임계 도달
+    risk = _risk(daily_loss=DailyLossState(start_equity=10_000_000, current_equity=9_700_000))
+    pipe = _pipe(session, risk=risk)
+    ctx = TickContext(
+        as_of=datetime(2026, 4, 20, 10), cash_available=5_000_000,
+        current_prices={"A": 1000},
+    )
+    pipe.run_tick(ctx)
+    session.commit()
+
+    events = session.query(RiskEvent).filter_by(event_type="risk_blocked").all()
+    assert len(events) == 1
+    assert events[0].action_taken == "daily_loss_limit"

@@ -37,8 +37,13 @@ def _setup_logging() -> None:
 
 
 def _make_job_handlers(settings, kis, notifier):
-    """Placeholder job bodies — 실제 job 구현은 W8 확장 단계에서 채움."""
+    """Job bodies — 실제 구현은 placeholder (stub).
 
+    전체 실구현은 Phase 3 실주행 단계에서 점진 채움. 현재는:
+      - 스케줄러가 정시에 호출되는지 확인 가능 (로그)
+      - midday_report 는 방어 윈도우 체크 후 빈 스냅샷으로 Discord 전송 시도
+      - 실 DB/KIS 데이터 수집은 Phase 3 에서 보강
+    """
     def master_refresh():
         logging.info("[job] master_refresh (stub) — re-download kospi/kosdaq mst")
 
@@ -55,6 +60,16 @@ def _make_job_handlers(settings, kis, notifier):
     def trading_tick():
         logging.info("[job] trading_tick at %s", datetime.now().time())
 
+    def midday_report():
+        # v3 방어 윈도우 체크 (11:55 ~ 12:15 외 호출은 skip)
+        from src.reporting.midday_report import in_valid_window
+        now = datetime.now()
+        if not in_valid_window(now):
+            logging.warning("[job] midday_report out of window (%s), skipping", now.time())
+            return
+        logging.info("[job] midday_report — 장중 스냅샷 전송 (stub)")
+        # Phase 3 보강: session_scope() + build_midday_snapshot + send_midday_report
+
     def daily_report():
         logging.info("[job] daily_report (stub) — Discord + archiver")
 
@@ -64,6 +79,7 @@ def _make_job_handlers(settings, kis, notifier):
         "analyze_score": analyze_score,
         "prepare_state": prepare_state,
         "trading_tick": trading_tick,
+        "midday_report": midday_report,
         "daily_report": daily_report,
     }
 
@@ -97,6 +113,7 @@ def main(argv: list[str] | None = None) -> int:
         analyze_score=jobs["analyze_score"],
         prepare_state=jobs["prepare_state"],
         trading_tick=jobs["trading_tick"],
+        midday_report=jobs["midday_report"],
         daily_report=jobs["daily_report"],
     )
 

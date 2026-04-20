@@ -124,9 +124,15 @@ def register_default_jobs(
     analyze_score: SchedulerJob,
     prepare_state: SchedulerJob,
     trading_tick: SchedulerJob,
+    midday_report: SchedulerJob,     # v3 추가
     daily_report: SchedulerJob,
 ) -> dict[str, str]:
-    """rules §5.1 타임라인에 맞춰 기본 작업 등록. job_id → name 매핑 반환."""
+    """rules §5.1 타임라인 + v3 미드데이 리포트 타임라인에 맞춰 기본 작업 등록.
+
+    타임라인 (영업일만):
+      07:30 master / 08:00 news / 08:30 score / 09:00 state /
+      09:10~15:20 tick / **12:00 midday** / 16:00 report
+    """
     out: dict[str, str] = {}
     out["master_refresh"] = sched.add_cron(master_refresh, name="master_refresh", hour=7, minute=30)
     out["news_collect"] = sched.add_cron(news_collect, name="news_collect", hour=8, minute=0)
@@ -136,5 +142,6 @@ def register_default_jobs(
         trading_tick, name="trading_tick",
         start=time(9, 10), end=time(15, 20), step_min=5,
     )
+    out["midday_report"] = sched.add_cron(midday_report, name="midday_report", hour=12, minute=0)
     out["daily_report"] = sched.add_cron(daily_report, name="daily_report", hour=16, minute=0)
     return out

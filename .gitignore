@@ -14,6 +14,19 @@ expired/
 
 # 로그 파일
 *.log
+*.err
+logs/
+run/
+
+# 빌드·커버리지 산출물
+.coverage
+.coverage.*
+htmlcov/
+.pytest_cache/
+
+# DB
+trading.db
+trading.db.*
 
 # Jupyter Notebook 체크포인트
 .ipynb_checkpoints/

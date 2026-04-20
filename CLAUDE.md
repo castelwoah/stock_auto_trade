@@ -61,11 +61,13 @@ mini_project/
 │   │   ├── breakout.py      # 변동성 돌파 legacy 포팅, 15:00 매수 중단 / 15:15 EOD 청산
 │   │   ├── news_swing.py    # 뉴스 스코어 기반 스윙 (5~10종목, 당일 청산 없음)
 │   │   └── registry.py      # 서브포트폴리오 현금 할당 + 신호 라우팅 (D2 격리, 금지 영역)
-│   ├── reporting/          # W6 신설
-│   │   ├── models.py        # DailyReport / MarketSummary / DataCollectionSummary / TradeEntry / PortfolioState / RiskStatus
-│   │   ├── daily_report.py  # render_text (rules §7.1 재현) + render_embed (색상 분기) + send_daily_report
-│   │   ├── intraday.py      # 체결(매수 녹·매도 손익별) / 리스크(주황) 즉시 Embed + notify_* helpers
-│   │   └── archiver.py      # 일별 JSON + trades CSV + 연간 세금 CSV (utf-8-sig, 멱등)
+│   ├── reporting/          # W6 신설 (v3 확장)
+│   │   ├── models.py        # DailyReport / MidDaySnapshot / AttemptEntry / MorningStats / PositionSnapshot / CandidateSnapshot / MidDayAnomaly / RESULT_* 상수
+│   │   ├── daily_report.py  # render_text (rules §7.1 + v3 실패·차단 섹션) + render_embed (색상 분기)
+│   │   ├── midday_report.py # v3 신설 — 12:00 장중 스냅샷, anomaly 탐지, 방어 윈도우(11:55~12:15)
+│   │   ├── pnl_calc.py      # v3 신설 — FIFO BUY↔SELL 매칭, 비용 반영 (스키마 무변경)
+│   │   ├── intraday.py      # 체결·리스크 즉시 Embed + notify_* helpers
+│   │   └── archiver.py      # 일별 JSON + trades CSV + 연간 세금 CSV
 │   ├── backtest/           # W7 린 신설 (v2)
 │   │   ├── portfolio_sim.py # SimFill/SimPosition + idempotency D8 + 왕복 1.03% 비용 (slip 0.25+fee 0.15+tax 0.23)
 │   │   ├── engine.py        # bar-by-bar 루프, risk_engine 의존 주입, Registry + sim + loader 통합
@@ -421,6 +423,33 @@ W8 (모의투자)   → 단일 세션 (관찰·튜닝)
       * `uninstall.sh` (sudo) — 전체 제거.
     - **운영 가이드 `docs/scheduling.md`**: 11 섹션 — 설치, 일상 운영(systemctl/journalctl), 타임라인, Phase 전환 절차(인프라 불변), 장애 대응, FAQ, 점검 체크리스트.
     - **Phase 전환 시 변경 대상**: `config.yaml` (KIS_ENV) + 데몬 재시작 (`sudo systemctl restart mini-trading`) **만**. systemd 유닛·crontab·코드는 불변.
+- **v3 리포트 확장 — 매매 시도 전체 로그화 + 미드데이(12:00) 스냅샷** (2026-04-20):
+    - 배경: 기존 리포트는 성공 체결만 표기 → 거절·취소·리스크 차단 이력이 전혀 드러나지 않음 → 전략 튜닝·장애 진단 자료 부족. 사용자 결정 4건: (1) v3 전체 채택, (2) 리스크 차단 code 별 카운트만, (3) intraday Discord 알림 과다 방지, (4) RiskEvent 재사용 (스키마 무변경).
+    - **인프라 보강**:
+      * `reporting/pnl_calc.py` — FIFO BUY↔SELL 매칭, 비용 정확 반영 (매수 0.15%, 매도 0.15% + 거래세 0.23%). Trade 테이블 스키마 변경 없이 리포트 시점 계산. 13 테스트 pass.
+      * `execution/order_manager.py` — STATUS 상수 5개 (`submitted/filled/rejected/cancelled_timeout/cancelled_eod/cancelled_manual`) + `mark_filled`·`_cancel_and_notify`·`mark_cancelled` 에서 `sqlalchemy.update` 로 Trade.status 자동 갱신.
+      * `execution/pipeline.py` — `_pass_risk` 에서 `RiskBlocked` catch 시 `RiskEvent(event_type='risk_blocked', action_taken=<code>)` INSERT. 2 테스트 추가.
+    - **모델 확장** (`reporting/models.py`):
+      * `AttemptEntry` — 실패·차단 시도 단일 레코드 (ts, symbol, action, qty, price, result, reason_code, reason_detail).
+      * `TradeExecutionSummary` — `rejections`/`cancellations`/`risk_blocks` 3 섹션 추가 + `risk_block_breakdown`/`cancellation_breakdown` 카운트 properties.
+      * v3 MidDay: `PositionSnapshot`/`CandidateSnapshot`/`MorningStats`/`MidDayAnomaly`/`MidDaySnapshot`.
+    - **Daily report render 확장** (`daily_report.py`):
+      * `■ 실패·차단` 섹션 추가. 거절은 최대 5건 상세 + "외 N건". 리스크 차단은 **code 별 카운트만** (가독성 우선).
+      * Embed 에도 "■ 실패·차단" 필드 추가. 6 테스트 추가 (20/20).
+    - **Midday report 신설** (`midday_report.py`, 12:00 KST):
+      * `render_midday_text` / `render_midday_embed` / `send_midday_report` / `detect_anomalies` / `in_valid_window`
+      * **7가지 anomaly 자동 탐지**: `circuit_breaker_active`/`daily_loss_near_limit`(90→critical, 70→warn)/`position_near_sl` (-4%↓)/`position_near_tp` (+6%↑, tp_armed=False 만)/`kospi_down_2pct`/`no_morning_activity` — critical 이상 1건이라도 있으면 Embed 색상 주황.
+      * **방어 윈도우 11:55~12:15** — Persistent=true timer 로 missed trigger 보상 시 엉뚱한 시각 발송 방지.
+      * 21 테스트 pass.
+    - **스케줄러 통합**:
+      * `scheduler/app.py` `register_default_jobs` 시그니처에 `midday_report` 추가 — 6→**7개 job**.
+      * `main.py` handler stub + scheduler wire-up + dry-run 검증.
+    - **v3 Gate 달성**: **459/459 pass** (기존 416 + v3 43 신규: pnl_calc 13 / pipeline risk_blocked 2 / daily 6 / midday 21 / scheduler 1).
+    - **rules 준수**:
+      * §4.2 DB 스키마 변경 금지 → Trade.pnl_krw 컬럼 추가 X, FIFO 매칭으로 우회.
+      * RiskEvent 재사용 (event_type='risk_blocked' / 'reconcile_mismatch').
+      * intraday Discord 과다 방지 → 실패·차단은 daily/midday 집계로만 전달.
+    - **다음 단계 (Phase 3 실주행 시 추가 실구현)**: handler 들의 실 DB/KIS 데이터 수집 (현재 stub). `build_midday_snapshot(session, kis)` 함수, `build_daily_report(session, kis)` 함수 추가 필요.
 
 ## Notes
 
