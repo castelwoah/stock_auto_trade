@@ -20,6 +20,7 @@ from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
 
 from src.scheduler.calendar import is_business_day
+from src.common.clock import now_kst, today_kst
 
 
 logger = logging.getLogger(__name__)
@@ -76,7 +77,7 @@ class TradingScheduler:
     ) -> str:
         """start ~ end 시간대에만 실행되는 interval job."""
         def _gated():
-            now = datetime.now()
+            now = now_kst()
             if business_days_only and not is_business_day(now.date()):
                 return
             t = now.time()
@@ -104,7 +105,7 @@ class TradingScheduler:
     @staticmethod
     def _wrap_business(job: SchedulerJob) -> SchedulerJob:
         def _inner():
-            today = datetime.now().date()
+            today = today_kst()
             if not is_business_day(today):
                 logger.debug("skipped non-business day: %s", today)
                 return

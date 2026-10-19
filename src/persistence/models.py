@@ -17,6 +17,7 @@ from sqlalchemy import (
     UniqueConstraint,
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
+from src.common.clock import now_kst
 
 
 class Base(DeclarativeBase):
@@ -37,7 +38,7 @@ class NewsArticle(Base):
     sentiment_score: Mapped[float | None] = mapped_column(Float, nullable=True)
     simhash64: Mapped[int | None] = mapped_column(BigInteger, nullable=True, index=True)
     published_at: Mapped[datetime] = mapped_column(DateTime, index=True)
-    retrieved_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    retrieved_at: Mapped[datetime] = mapped_column(DateTime, default=now_kst)
     raw: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
 
     symbols: Mapped[list["ArticleSymbol"]] = relationship(
@@ -80,7 +81,7 @@ class StockScore(Base):
     scoring_ver: Mapped[str] = mapped_column(String(32))
     sentiment_model_ver: Mapped[str | None] = mapped_column(String(64), nullable=True)
     llm_prompt_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
-    computed_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    computed_at: Mapped[datetime] = mapped_column(DateTime, default=now_kst)
 
     __table_args__ = (
         UniqueConstraint(
@@ -95,7 +96,7 @@ class Trade(Base):
     __tablename__ = "trades"
 
     id: Mapped[int] = mapped_column(primary_key=True)
-    ts: Mapped[datetime] = mapped_column(DateTime, index=True, default=datetime.utcnow)
+    ts: Mapped[datetime] = mapped_column(DateTime, index=True, default=now_kst)
     symbol: Mapped[str] = mapped_column(String(12), index=True)
     side: Mapped[str] = mapped_column(String(4))  # BUY / SELL
     qty: Mapped[int] = mapped_column(Integer)
@@ -130,7 +131,7 @@ class Position(Base):
     take_profit: Mapped[float | None] = mapped_column(Float, nullable=True)
     halt_flag: Mapped[bool] = mapped_column(default=False)  # D13 거래정지 표시
     updated_at: Mapped[datetime] = mapped_column(
-        DateTime, default=datetime.utcnow, onupdate=datetime.utcnow
+        DateTime, default=now_kst, onupdate=now_kst
     )
 
 
@@ -138,7 +139,7 @@ class RiskEvent(Base):
     __tablename__ = "risk_events"
 
     id: Mapped[int] = mapped_column(primary_key=True)
-    ts: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
+    ts: Mapped[datetime] = mapped_column(DateTime, default=now_kst, index=True)
     event_type: Mapped[str] = mapped_column(String(32), index=True)
     symbol: Mapped[str | None] = mapped_column(String(12), nullable=True)
     detail: Mapped[str | None] = mapped_column(Text, nullable=True)

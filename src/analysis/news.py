@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Iterable
 
+from src.common.clock import now_kst
 from src.analysis.contracts import FactorScore, linear_map
 from src.analysis.sentiment import (
     SENTIMENT_MODEL_VER,
@@ -40,7 +41,7 @@ def compute_news_score(
     - 가중 평균 sentiment ∈ [-1, +1] 을 0~100 으로 선형 매핑
     - 중립(키워드 매칭 無) 기사는 평균 계산에서 제외하되 count 는 카운트
     """
-    ref = now or datetime.now()
+    ref = now or now_kst()
     total_w = 0.0
     total_sw = 0.0
     hit_count = 0

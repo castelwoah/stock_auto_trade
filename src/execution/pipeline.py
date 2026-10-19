@@ -28,6 +28,7 @@ from src.risk.limits import BuyContext, RiskEngine, set_risk_engine
 from src.risk.sizing import resolve_quantity
 from src.strategy.base import Action, Signal, StrategyContext
 from src.strategy.registry import StrategyRegistry, build_idempotency_key
+from src.common.clock import now_kst
 
 
 logger = logging.getLogger(__name__)
@@ -182,7 +183,7 @@ class TradingPipeline:
     def _record_risk_block(self, sig: Signal, rb: RiskBlocked, ts) -> None:
         try:
             event = RiskEvent(
-                ts=ts if isinstance(ts, _dt) else _dt.now(),
+                ts=ts if isinstance(ts, _dt) else now_kst(),
                 event_type="risk_blocked",
                 symbol=sig.symbol,
                 detail=f"{sig.action.value} {sig.symbol} @{sig.strategy_id}: {rb.detail}",

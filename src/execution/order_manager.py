@@ -29,6 +29,7 @@ from typing import Callable
 
 import requests
 
+from src.common.clock import now_kst
 from src.clients.discord import DiscordNotifier
 from src.clients.kis import KisClient, KisOrderRejected, OrderAck, OrderFill
 from src.execution.krx_tick import round_to_tick, shift_ticks
@@ -114,7 +115,7 @@ class OrderManager:
         kis_client: KisClient,
         portfolio: LivePortfolio,
         notifier: DiscordNotifier | None = None,
-        now_provider: Callable[[], datetime] = datetime.now,
+        now_provider: Callable[[], datetime] = now_kst,
         max_retries: int = MAX_RETRIES,
         resubmit_after_seconds: int = RESUBMIT_AFTER_SECONDS,
         shadow: bool = False,

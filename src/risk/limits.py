@@ -18,6 +18,7 @@ from datetime import date, datetime
 from functools import wraps
 from typing import Any, Callable, Iterable
 
+from src.common.clock import now_kst
 from src.risk.blacklist import (
     BlacklistProvider,
     LiquidityThresholds,
@@ -205,7 +206,7 @@ class RiskEngine:
         cooldown_policy: CooldownPolicy = CooldownPolicy(),
         liquidity_thresholds: LiquidityThresholds = LiquidityThresholds(),
         trades_history: Iterable[TradeRecord] = (),
-        now_provider: Callable[[], datetime] = datetime.now,
+        now_provider: Callable[[], datetime] = now_kst,
         capital_cap_krw: float | None = None,
     ) -> None:
         if capital_cap_krw is not None and capital_cap_krw < 0:

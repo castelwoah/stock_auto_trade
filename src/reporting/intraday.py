@@ -15,10 +15,11 @@ from src.reporting.daily_report import (
     COLOR_WARNING,
 )
 from src.reporting.models import TradeEntry
+from src.common.clock import now_kst
 
 
 def _iso_now() -> str:
-    return datetime.now().isoformat(timespec="seconds")
+    return now_kst().isoformat(timespec="seconds")
 
 
 def render_buy_embed(entry: TradeEntry, *, strategy_id: str = "") -> dict[str, Any]:

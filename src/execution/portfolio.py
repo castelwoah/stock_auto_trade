@@ -20,6 +20,7 @@ from sqlalchemy.orm import Session
 from src.persistence.models import Position, Trade
 from src.strategy.base import PositionState
 from src.strategy.exit_signals import should_arm_trailing
+from src.common.clock import now_kst
 
 
 logger = logging.getLogger(__name__)
@@ -217,7 +218,7 @@ class LivePortfolio:
             return
         if pos.highest_price is None or new_price > pos.highest_price:
             pos.highest_price = new_price
-            pos.updated_at = datetime.now()
+            pos.updated_at = now_kst()
             self.session.flush()
 
     def mark_halt(self, symbol: str, strategy_id: str, *, halted: bool = True) -> None:

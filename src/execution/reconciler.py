@@ -19,6 +19,7 @@ from sqlalchemy.orm import Session
 
 from src.clients.kis import KisClient
 from src.persistence.models import Position, RiskEvent
+from src.common.clock import now_kst
 
 
 logger = logging.getLogger(__name__)
@@ -138,7 +139,7 @@ class Reconciler:
 
     def _record_event(self, detail: str, diffs: list[tuple[str, int, int]]) -> None:
         self.session.add(RiskEvent(
-            ts=datetime.now(),
+            ts=now_kst(),
             event_type="reconcile_mismatch",
             symbol=None if len(diffs) > 1 else diffs[0][0],
             detail=detail,

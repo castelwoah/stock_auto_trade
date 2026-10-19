@@ -14,6 +14,7 @@ from datetime import datetime
 from typing import Iterator
 
 from src.ingestion.base_scraper import Article, BaseScraper
+from src.common.clock import now_kst
 
 
 logger = logging.getLogger(__name__)
@@ -48,7 +49,7 @@ class DartScraper(BaseScraper):
     # ------------------------------------------------------------------
 
     def fetch(self, since: datetime | None = None) -> Iterator[Article]:
-        today = datetime.now()
+        today = now_kst()
         if since is None:
             bgn_de = today.strftime("%Y%m%d")
         else:

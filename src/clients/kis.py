@@ -12,6 +12,7 @@ import requests
 
 from src.clients.rate_limiter import TokenBucket
 from src.config import Settings
+from src.common.clock import now_kst, today_kst
 
 
 logger = logging.getLogger(__name__)
@@ -78,7 +79,7 @@ class TokenStore:
         self.expired_dir = root / self.EXPIRED_DIR_NAME
 
     def current_path(self) -> Path:
-        return self.root / f"{self.TOKEN_PREFIX}{datetime.today().strftime('%Y%m%d')}"
+        return self.root / f"{self.TOKEN_PREFIX}{now_kst().strftime('%Y%m%d')}"
 
     def read(self) -> CachedToken | None:
         p = self.current_path()
@@ -95,7 +96,7 @@ class TokenStore:
                     valid = datetime.strptime(raw, "%Y-%m-%d %H:%M:%S")
                 except ValueError:
                     valid = None
-        if token and valid and valid > datetime.now():
+        if token and valid and valid > now_kst():
             return CachedToken(value=token, valid_until=valid)
         return None
 
@@ -110,7 +111,7 @@ class TokenStore:
 
     def move_expired(self) -> int:
         self.expired_dir.mkdir(parents=True, exist_ok=True)
-        today = datetime.today().date()
+        today = today_kst()
         moved = 0
         for f in self.root.iterdir():
             if not f.is_file():
@@ -123,7 +124,7 @@ class TokenStore:
             except ValueError:
                 continue
             if d < today:
-                ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+                ts = now_kst().strftime("%Y%m%d_%H%M%S")
                 dest = self.expired_dir / f"{ts}_{name}"
                 shutil.move(str(f), str(dest))
                 moved += 1
@@ -350,7 +351,7 @@ class KisClient:
         rows = data.get("output") or []
         if not rows:
             return None
-        today_str = datetime.today().strftime("%Y%m%d")
+        today_str = now_kst().strftime("%Y%m%d")
         prev = None
         for r in rows:
             d = r.get("stck_bsop_date")

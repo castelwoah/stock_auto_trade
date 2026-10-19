@@ -5,6 +5,7 @@ from datetime import datetime
 from typing import Any
 
 import requests
+from src.common.clock import now_kst
 
 
 logger = logging.getLogger(__name__)
@@ -48,5 +49,5 @@ class DiscordNotifier:
     def _format(msg: str, include_timestamp: bool) -> str:
         if not include_timestamp:
             return str(msg)
-        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        ts = now_kst().strftime("%Y-%m-%d %H:%M:%S")
         return f"[{ts}] {msg}"

@@ -33,6 +33,7 @@ from src.reporting.builders import build_daily_report, build_midday_snapshot
 from src.reporting.daily_report import send_daily_report
 from src.reporting.midday_report import in_valid_window, send_midday_report
 from src.scheduler.app import TradingScheduler, register_default_jobs
+from src.common.clock import now_kst, today_kst
 
 
 def _setup_logging() -> None:
@@ -64,10 +65,10 @@ def _make_job_handlers(settings, kis, notifier):
         # 실제 Reconciler.verify_with_grace() 호출은 pipeline 주입 후 활성
 
     def trading_tick():
-        logging.info("[job] trading_tick at %s", datetime.now().time())
+        logging.info("[job] trading_tick at %s", now_kst().time())
 
     def midday_report():
-        now = datetime.now()
+        now = now_kst()
         if not in_valid_window(now):
             logging.warning("[job] midday_report out of window (%s), skipping", now.time())
             return
@@ -80,10 +81,10 @@ def _make_job_handlers(settings, kis, notifier):
                          len(snap.positions), len(snap.top_candidates), len(snap.anomalies))
         except Exception:
             logging.exception("midday_report failed")
-            notifier.send(f"[main] midday_report 실패: {datetime.now().isoformat()}")
+            notifier.send(f"[main] midday_report 실패: {now_kst().isoformat()}")
 
     def daily_report():
-        today = date.today()
+        today = today_kst()
         logging.info("[job] daily_report for %s", today)
         try:
             archiver = Archiver(settings.ARCHIVE_ROOT)
@@ -101,7 +102,7 @@ def _make_job_handlers(settings, kis, notifier):
             )
         except Exception:
             logging.exception("daily_report failed")
-            notifier.send(f"[main] daily_report 실패: {datetime.now().isoformat()}")
+            notifier.send(f"[main] daily_report 실패: {now_kst().isoformat()}")
 
     return {
         "master_refresh": master_refresh,

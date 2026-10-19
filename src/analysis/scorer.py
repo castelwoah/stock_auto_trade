@@ -16,6 +16,7 @@ from typing import Any
 
 from src.analysis.contracts import FactorScore, clip_score
 from src.analysis.sentiment import SENTIMENT_MODEL_VER
+from src.common.clock import today_kst
 
 
 SCORING_VERSION = "v1.0"
@@ -115,7 +116,7 @@ def prompt_hash(prompt_text: str | None) -> str | None:
 def to_stock_score_row(cs: CompositeScore, *, score_date: _date | None = None) -> dict[str, Any]:
     """Map CompositeScore to StockScore ORM kwargs for bulk insert/upsert."""
     return {
-        "score_date": score_date or datetime.now().date(),
+        "score_date": score_date or today_kst(),
         "symbol": cs.symbol,
         "news_score": cs.news,
         "financial_score": cs.financial,
