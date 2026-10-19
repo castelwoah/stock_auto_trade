@@ -492,3 +492,50 @@ def test_restore_skips_closed_and_restores_unknown(session):
     session.commit()
     om2, n = _restart(session, kis, clock)
     assert n == 1 and "unknown:u" in om2.pending
+
+
+
+# ---------------------------------------------------------------------------
+# 매도 재시도 (거절·차단 후)
+# ---------------------------------------------------------------------------
+
+def test_rejected_sell_is_reattempted_without_discount(session):
+    kis = FakeKis()
+    kis.order_errors.append(KisOrderRejected("APBK1234", "가격제한폭 초과"))
+    om, _ = _om(session, kis)
+    assert om.submit(_sig(Action.SELL, qty=5), limit_price=70_000, qty=5,
+                     idempotency_key="s") is None
+    po = om.submit(_sig(Action.SELL, qty=5), limit_price=70_000, qty=5, idempotency_key="s")
+    assert po is not None and kis.orders[0]["price"] == 70_000      # 할인 없음
+    rows = {t.idempotency_key: t.status for t in session.query(Trade).all()}
+    assert rows == {"s": "rejected", "s#a1": "submitted"}
+
+
+def test_live_sell_is_not_reattempted(session):
+    kis = FakeKis()
+    om, _ = _om(session, kis)
+    om.submit(_sig(Action.SELL, qty=5), limit_price=70_000, qty=5, idempotency_key="s")
+    assert om.submit(_sig(Action.SELL, qty=5), limit_price=70_000, qty=5,
+                     idempotency_key="s") is None
+    assert len(kis.orders) == 1
+
+
+def test_sell_reattempts_capped(session):
+    from src.execution.order_manager import MAX_SELL_REATTEMPTS
+
+    kis = FakeKis()
+    kis.order_errors.extend(KisOrderRejected("X", "rej") for _ in range(10))
+    om, _ = _om(session, kis)
+    for _ in range(10):
+        om.submit(_sig(Action.SELL, qty=5), limit_price=70_000, qty=5, idempotency_key="s")
+    assert session.query(Trade).count() == 1 + MAX_SELL_REATTEMPTS
+
+
+def test_rejected_buy_is_not_reattempted(session):
+    kis = FakeKis()
+    kis.order_errors.append(KisOrderRejected("X", "rej"))
+    om, _ = _om(session, kis)
+    om.submit(_sig(), limit_price=70_000, qty=1, idempotency_key="b", buy_context=_ctx())
+    assert om.submit(_sig(), limit_price=70_000, qty=1, idempotency_key="b",
+                     buy_context=_ctx()) is None
+    assert session.query(Trade).count() == 1

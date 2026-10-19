@@ -50,6 +50,7 @@ RESUBMIT_AFTER_SECONDS = 180   # 3 min
 ENTRY_CUTOFF = time(15, 0)
 EOD_CANCEL = time(15, 15)
 SELL_INITIAL_DISCOUNT = 0.01   # 매도 첫 지정가 = 현재가 × (1 − 1%) → 즉시 체결 지향
+MAX_SELL_REATTEMPTS = 5        # 매도가 거절·차단으로 끝난 뒤 같은 신호의 재시도 상한 (일)
 
 # Trade.status 값 상수 — v3 시도 로그 정규화
 STATUS_SUBMITTED = "submitted"
@@ -168,6 +169,20 @@ class OrderManager:
             status=STATUS_SHADOW if self.shadow else STATUS_SUBMITTED,
             note=signal.reason,
         ))
+        if trade is None and signal.action == Action.SELL:
+            # 청산은 거절·차단으로 끝났어도 다시 시도해야 한다 (손절이 하루 종일 막히지 않도록).
+            # 재시도 가격은 할인 없이 현재가 내림 정렬 — 하한가 근처 −1% 거절을 피한다.
+            retry_key = self._sell_reattempt_key(idempotency_key)
+            if retry_key is not None:
+                idempotency_key = retry_key
+                price = round_to_tick(limit_price, up=False)
+                trade = self.portfolio.insert_trade_if_new(TradeRecord(
+                    symbol=signal.symbol, side=signal.action.value, qty=qty, price=price,
+                    strategy_id=signal.strategy_id, strategy_ver=strategy_ver,
+                    signal_id=signal.signal_id, idempotency_key=retry_key, order_id=None,
+                    status=STATUS_SHADOW if self.shadow else STATUS_SUBMITTED,
+                    note=f"re-attempt after rejected/blocked: {signal.reason}",
+                ))
         if trade is None:
             logger.warning("duplicate idempotency_key — order NOT sent: %s", idempotency_key)
             return None
@@ -175,6 +190,20 @@ class OrderManager:
             signal, trade=trade, price=price, qty=qty,
             idempotency_key=idempotency_key, retries=0, buy_context=buy_context,
         )
+
+    def _sell_reattempt_key(self, base_key: str) -> str | None:
+        """직전 시도가 rejected/blocked 로 끝났을 때만 다음 시도 키(`#aN`)를 준다."""
+        prev = base_key
+        for n in range(1, MAX_SELL_REATTEMPTS + 1):
+            t = self.portfolio.get_trade(prev)
+            if t is None or t.status not in (STATUS_REJECTED, STATUS_BLOCKED):
+                return None
+            cand = f"{base_key}#a{n}"
+            if self.portfolio.get_trade(cand) is None:
+                return cand
+            prev = cand
+        logger.error("sell re-attempts exhausted for %s", base_key)
+        return None
 
     def _send(
         self,
