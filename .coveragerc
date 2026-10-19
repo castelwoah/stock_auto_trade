@@ -1,0 +1,9 @@
+[run]
+source = src
+relative_files = True
+# 측정 데이터는 별도 파일로 — 저장소 루트 .coverage 를 덮어쓰지 않는다.
+data_file = .coverage.claude
+
+[report]
+show_missing = True
+skip_empty = True
