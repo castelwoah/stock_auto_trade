@@ -17,6 +17,50 @@ from src.config import Settings
 logger = logging.getLogger(__name__)
 
 
+# 주문 거래소 구분 (공식 예제: order_cash 필수 필드 EXCG_ID_DVSN_CD)
+EXCHANGE_CODE = "KRX"
+# 지정가만 허용 (D14 · rules §6: 시장가 금지)
+ORD_DVSN_LIMIT = "00"
+ALLOWED_ORD_DVSN = frozenset({ORD_DVSN_LIMIT})
+# 일별주문체결조회 연속조회 상한 (페이지 15~100건 → 충분)
+CCLD_MAX_PAGES = 20
+
+
+class KisOrderRejected(RuntimeError):
+    """KIS 가 HTTP 200 으로 응답했으나 rt_cd != '0' (주문 거절)."""
+
+    def __init__(self, msg_cd: str, msg1: str) -> None:
+        super().__init__(f"[{msg_cd}] {msg1}")
+        self.msg_cd = msg_cd
+        self.msg1 = msg1
+
+
+@dataclass(frozen=True)
+class OrderAck:
+    """주문 접수 응답. 취소에는 odno + orgno(한국거래소전송주문조직번호) 모두 필요."""
+
+    odno: str
+    orgno: str
+    ord_tmd: str = ""
+
+
+@dataclass(frozen=True)
+class OrderFill:
+    """일별주문체결조회 output1 1건 (해당 주문의 누적 상태)."""
+
+    odno: str
+    symbol: str
+    side: str            # BUY / SELL
+    ord_qty: int
+    filled_qty: int
+    avg_price: float
+    remaining_qty: int
+    cancelled: bool
+    # 주문채번지점번호 — 주문 응답의 KRX_FWDG_ORD_ORGNO 와 같은 값으로 가정
+    # (응답 유실 주문을 체결조회로 복구해 취소할 때 사용. 실전 스모크 테스트에서 확인)
+    orgno: str = ""
+
+
 @dataclass
 class CachedToken:
     value: str
@@ -113,9 +157,11 @@ class KisClient:
         self.cano = settings.CANO
         self.acnt_prdt_cd = settings.ACNT_PRDT_CD
         self.timeout = timeout
+        self.tr_ids = settings.kis_profile.tr_ids
+        rate = settings.TOKEN_BUCKET_REFILL_RATE or settings.kis_profile.rate_per_sec
         self.bucket = bucket or TokenBucket(
-            capacity=settings.TOKEN_BUCKET_CAPACITY,
-            refill_rate=settings.TOKEN_BUCKET_REFILL_RATE,
+            capacity=settings.TOKEN_BUCKET_CAPACITY or max(1, int(rate)),
+            refill_rate=rate,
         )
         self.token_store = token_store or TokenStore(settings.TOKEN_DIR)
         self._access_token: str | None = None
@@ -170,15 +216,24 @@ class KisClient:
     # ------------------------------------------------------------------
 
     def _get(self, path: str, tr_id: str, params: dict[str, Any]) -> dict[str, Any]:
+        return self._get_with_cont(path, tr_id, params)[0]
+
+    def _get_with_cont(
+        self, path: str, tr_id: str, params: dict[str, Any], *, tr_cont: str = ""
+    ) -> tuple[dict[str, Any], str]:
+        """GET + 응답 헤더 tr_cont (연속조회: 'M'/'F' = 다음 페이지 있음)."""
         self.bucket.acquire()
+        headers = self._headers(tr_id)
+        if tr_cont:
+            headers["tr_cont"] = tr_cont
         res = requests.get(
             f"{self.base_url}/{path}",
-            headers=self._headers(tr_id),
+            headers=headers,
             params=params,
             timeout=self.timeout,
         )
         res.raise_for_status()
-        return res.json()
+        return res.json(), res.headers.get("tr_cont", "")
 
     def _post(self, path: str, tr_id: str, body: dict[str, Any]) -> dict[str, Any]:
         self.bucket.acquire()
@@ -208,10 +263,34 @@ class KisClient:
             raise RuntimeError(f"current price fetch failed: {data.get('msg1')}")
         return int(data["output"]["stck_prpr"])
 
+    def get_quote(self, code: str) -> dict[str, float]:
+        """현재가 + 시가총액 (P0-5).
+
+        hts_avls 단위는 억원으로 가정 → 원 환산 (공식 예제에 단위 미표기 — 실전
+        스모크 테스트에서 확인). trade_value 는 당일 누적이라 장 초반엔 작으므로
+        유동성 게이트는 get_prev_day_ohlc 의 avg_trade_value_20d 를 쓴다.
+        """
+        data = self._get(
+            "uapi/domestic-stock/v1/quotations/inquire-price",
+            tr_id="FHKST01010100",
+            params={
+                "fid_cond_mrkt_div_code": "J",
+                "fid_input_iscd": code,
+            },
+        )
+        if data.get("rt_cd") != "0":
+            raise RuntimeError(f"quote fetch failed: {data.get('msg1')}")
+        out = data["output"]
+        return {
+            "price": float(out["stck_prpr"]),
+            "market_cap": float(out.get("hts_avls") or 0) * 100_000_000,
+            "trade_value": float(out.get("acml_tr_pbmn") or 0),
+        }
+
     def get_cash_balance(self, ref_code: str = "005930", ref_price: str = "65500") -> int:
         data = self._get(
             "uapi/domestic-stock/v1/trading/inquire-psbl-order",
-            tr_id="TTTC8908R",
+            tr_id=self.tr_ids["psbl_order"],
             params={
                 "CANO": self.cano,
                 "ACNT_PRDT_CD": self.acnt_prdt_cd,
@@ -229,7 +308,7 @@ class KisClient:
     def get_stock_balance(self) -> tuple[dict[str, int], dict[str, Any]]:
         data = self._get(
             "uapi/domestic-stock/v1/trading/inquire-balance",
-            tr_id="TTTC8434R",
+            tr_id=self.tr_ids["balance"],
             params={
                 "CANO": self.cano,
                 "ACNT_PRDT_CD": self.acnt_prdt_cd,
@@ -282,11 +361,16 @@ class KisClient:
             prev = rows[1]
         if prev is None:
             return None
+        # 유동성 게이트용 20일 평균 거래대금 ≈ mean(거래량 × 종가), 당일 제외
+        past = [r for r in rows if (r.get("stck_bsop_date") or "") < today_str][:20]
+        values = [_to_int(r.get("acml_vol")) * _to_int(r.get("stck_clpr")) for r in past]
+        avg_value = sum(values) / len(values) if values else 0.0
         return {
             "date": prev.get("stck_bsop_date"),
             "high": prev.get("stck_hgpr"),
             "low": prev.get("stck_lwpr"),
             "open_today": rows[0].get("stck_oprc"),
+            "avg_trade_value_20d": str(avg_value),
         }
 
     def order(
@@ -295,20 +379,23 @@ class KisClient:
         qty: int,
         side: str,
         *,
-        ord_dvsn: str = "01",
+        ord_dvsn: str = ORD_DVSN_LIMIT,
         unit_price: str = "0",
-    ) -> dict[str, Any]:
-        """Place an order.
+    ) -> OrderAck:
+        """지정가 주문. 거절(rt_cd != '0')은 KisOrderRejected.
 
-        side: 'BUY' | 'SELL'
-        ord_dvsn: '00' = 지정가, '01' = 시장가 (legacy default; W5+에서 지정가로 이행)
-        unit_price: 지정가 시 가격, 시장가는 '0'
+        네트워크 예외(requests.RequestException)는 그대로 전파된다 — 주문이 실제로
+        접수됐을 수 있으므로 호출측은 '거절'이 아니라 '불명(unknown)'으로 다룬다.
         """
         side_upper = side.upper()
         if side_upper not in {"BUY", "SELL"}:
             raise ValueError("side must be 'BUY' or 'SELL'")
-        tr_id = "TTTC0012U" if side_upper == "BUY" else "TTTC0011U"
-        return self._post(
+        if ord_dvsn not in ALLOWED_ORD_DVSN:
+            raise ValueError(f"ord_dvsn {ord_dvsn!r} not allowed (limit orders only)")
+        if int(qty) <= 0 or int(float(unit_price)) <= 0:
+            raise ValueError("qty and unit_price must be positive")
+        tr_id = self.tr_ids["buy" if side_upper == "BUY" else "sell"]
+        data = self._post(
             "uapi/domestic-stock/v1/trading/order-cash",
             tr_id=tr_id,
             body={
@@ -317,6 +404,102 @@ class KisClient:
                 "PDNO": code,
                 "ORD_DVSN": ord_dvsn,
                 "ORD_QTY": str(int(qty)),
-                "ORD_UNPR": str(unit_price),
+                "ORD_UNPR": str(int(float(unit_price))),
+                "EXCG_ID_DVSN_CD": EXCHANGE_CODE,
             },
         )
+        if data.get("rt_cd") != "0":
+            raise KisOrderRejected(str(data.get("msg_cd", "")), str(data.get("msg1", "")))
+        out = data.get("output") or {}
+        return OrderAck(
+            odno=str(out.get("ODNO") or ""),
+            orgno=str(out.get("KRX_FWDG_ORD_ORGNO") or ""),
+            ord_tmd=str(out.get("ORD_TMD") or ""),
+        )
+
+    def cancel_order(self, odno: str, orgno: str) -> None:
+        """잔량 전부 취소 (RVSE_CNCL_DVSN_CD=02, QTY_ALL_ORD_YN=Y). 실패 시 예외."""
+        if not odno or not orgno:
+            raise ValueError("cancel requires both odno and orgno")
+        data = self._post(
+            "uapi/domestic-stock/v1/trading/order-rvsecncl",
+            tr_id=self.tr_ids["cancel"],
+            body={
+                "CANO": self.cano,
+                "ACNT_PRDT_CD": self.acnt_prdt_cd,
+                "KRX_FWDG_ORD_ORGNO": orgno,
+                "ORGN_ODNO": odno,
+                "ORD_DVSN": ORD_DVSN_LIMIT,
+                "RVSE_CNCL_DVSN_CD": "02",
+                "ORD_QTY": "0",
+                "ORD_UNPR": "0",
+                "QTY_ALL_ORD_YN": "Y",
+                "EXCG_ID_DVSN_CD": EXCHANGE_CODE,
+            },
+        )
+        if data.get("rt_cd") != "0":
+            raise KisOrderRejected(str(data.get("msg_cd", "")), str(data.get("msg1", "")))
+
+    def inquire_today_orders(self, day: str) -> list[OrderFill]:
+        """당일(day=YYYYMMDD) 전체 주문의 체결 상태. 연속조회로 전 페이지 수집."""
+        fills: list[OrderFill] = []
+        fk = nk = ""
+        tr_cont = ""
+        for _ in range(CCLD_MAX_PAGES):
+            data, next_cont = self._get_with_cont(
+                "uapi/domestic-stock/v1/trading/inquire-daily-ccld",
+                tr_id=self.tr_ids["daily_ccld"],
+                params={
+                    "CANO": self.cano,
+                    "ACNT_PRDT_CD": self.acnt_prdt_cd,
+                    "INQR_STRT_DT": day,
+                    "INQR_END_DT": day,
+                    "SLL_BUY_DVSN_CD": "00",
+                    "PDNO": "",
+                    "CCLD_DVSN": "00",
+                    "INQR_DVSN": "00",
+                    "INQR_DVSN_3": "00",
+                    "ORD_GNO_BRNO": "",
+                    "ODNO": "",
+                    "INQR_DVSN_1": "",
+                    "CTX_AREA_FK100": fk,
+                    "CTX_AREA_NK100": nk,
+                    "EXCG_ID_DVSN_CD": EXCHANGE_CODE,
+                },
+                tr_cont=tr_cont,
+            )
+            if data.get("rt_cd") != "0":
+                raise RuntimeError(f"daily ccld fetch failed: {data.get('msg1')}")
+            for r in data.get("output1") or []:
+                fills.append(_parse_fill(r))
+            if next_cont not in ("M", "F"):
+                break
+            fk = data.get("ctx_area_fk100", "")
+            nk = data.get("ctx_area_nk100", "")
+            tr_cont = "N"
+        return fills
+
+
+def _to_int(v: Any) -> int:
+    try:
+        return int(float(v or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _parse_fill(r: dict[str, Any]) -> OrderFill:
+    try:
+        avg = float(r.get("avg_prvs") or 0)
+    except (TypeError, ValueError):
+        avg = 0.0
+    return OrderFill(
+        odno=str(r.get("odno") or ""),
+        symbol=str(r.get("pdno") or ""),
+        side="SELL" if r.get("sll_buy_dvsn_cd") == "01" else "BUY",
+        ord_qty=_to_int(r.get("ord_qty")),
+        filled_qty=_to_int(r.get("tot_ccld_qty")),
+        avg_price=avg,
+        remaining_qty=_to_int(r.get("rmn_qty")),
+        cancelled=(r.get("cncl_yn") == "Y"),
+        orgno=str(r.get("ord_gno_brno") or ""),
+    )

@@ -1,6 +1,13 @@
 """Tick pipeline: analysis → strategy → risk_gate → order_manager.
 
 각 영업일 본 트레이딩 루프의 "하나의 tick" 단위 실행 체인.
+
+v4:
+  - tick 시작 시 `set_risk_engine(self.risk)` — APScheduler 워커 스레드는 ContextVar 를
+    상속하지 않으므로 tick 을 실행하는 스레드에서 매번 설치 (D14 @risk_gate 전제)
+  - kill switch: 켜져 있으면 신규 매수만 차단, 청산은 진행
+  - 보유 포지션 highest_price 를 매 tick 갱신 (D3 Trailing 영속화)
+  - 유동성 게이트는 TickContext.liquidity 실데이터 사용, 없으면 fail-closed
 """
 from __future__ import annotations
 
@@ -17,7 +24,7 @@ from src.execution.portfolio import LivePortfolio
 from src.execution.reconciler import Reconciler
 from src.persistence.models import RiskEvent
 from src.risk.exceptions import RiskBlocked
-from src.risk.limits import BuyContext, RiskEngine
+from src.risk.limits import BuyContext, RiskEngine, set_risk_engine
 from src.risk.sizing import resolve_quantity
 from src.strategy.base import Action, Signal, StrategyContext
 from src.strategy.registry import StrategyRegistry, build_idempotency_key
@@ -39,6 +46,11 @@ class TickContext:
     candidate_scores: dict[str, float] = field(default_factory=dict)
     prev_day_ohlc: dict[str, dict[str, float]] = field(default_factory=dict)
     portfolio_value: float | None = None
+    # symbol → (시가총액 원, 20일 평균 거래대금 원). 누락 종목은 매수 fail-closed.
+    liquidity: dict[str, tuple[float | None, float | None]] = field(default_factory=dict)
+
+
+KillSwitch = Callable[[], bool]
 
 
 class TradingPipeline:
@@ -53,6 +65,7 @@ class TradingPipeline:
         portfolio: LivePortfolio,
         reconciler: Reconciler,
         strategy_ver: str = "v1.0",
+        kill_switch: KillSwitch | None = None,
     ) -> None:
         self.registry = registry
         self.risk = risk_engine
@@ -60,6 +73,7 @@ class TradingPipeline:
         self.portfolio = portfolio
         self.reconciler = reconciler
         self.strategy_ver = strategy_ver
+        self.kill_switch = kill_switch
         self._trading_off = False
         self._trading_off_reason: str | None = None
 
@@ -78,17 +92,27 @@ class TradingPipeline:
     # ------------------------------------------------------------------
     def run_tick(self, ctx: TickContext) -> list[Signal]:
         """Generate + filter + submit signals. 실행된 시그널을 반환."""
+        # D14: 이 스레드에 엔진 설치 (OrderManager._place 의 @risk_gate 가 사용)
+        set_risk_engine(self.risk)
+
         # Daily loss 갱신 (평가금 기준)
         if ctx.portfolio_value is not None:
             self.risk.daily_loss.current_equity = ctx.portfolio_value
 
-        # pending 주문 폴링 (타임아웃 재시도·EOD 취소)
+        # pending 주문: 체결 동기화 · 타임아웃 재주문 · EOD 취소
         self.orders.poll(current_prices=ctx.current_prices)
 
         if self.is_trading_off():
             logger.warning("trading off: %s", self._trading_off_reason)
             return []
 
+        # D3: 보유 포지션 고점 갱신 → Trailing 무장 상태가 재시작 후에도 유지
+        for pos in list(self.portfolio.iter_open_positions()):
+            px = ctx.current_prices.get(pos.symbol)
+            if px:
+                self.portfolio.update_highest_price(pos.symbol, pos.strategy_id, new_price=px)
+
+        entries_allowed = not self._kill_switch_on()
         positions_state = self.portfolio.positions_as_state(current_prices=ctx.current_prices)
         today = ctx.as_of.date()
         strat_ctx = StrategyContext(
@@ -103,18 +127,33 @@ class TradingPipeline:
 
         executed: list[Signal] = []
         for sig in self.registry.all_signals(strat_ctx):
-            if not self._pass_risk(sig, ctx):
+            if sig.action == Action.BUY and not entries_allowed:
                 continue
-            if not self._execute(sig, ctx, today):
+            buy_ctx = self._build_buy_context(sig, ctx) if sig.action == Action.BUY else None
+            if not self._pass_risk(sig, ctx, buy_ctx):
+                continue
+            if not self._execute(sig, ctx, today, buy_ctx):
                 continue
             executed.append(sig)
         return executed
 
+    def _kill_switch_on(self) -> bool:
+        if self.kill_switch is None:
+            return False
+        try:
+            on = bool(self.kill_switch())
+        except Exception:
+            logger.exception("kill switch check failed — treating as ON (fail-closed)")
+            return True
+        if on:
+            logger.warning("kill switch ON — new entries blocked, exits continue")
+        return on
+
     # ------------------------------------------------------------------
-    def _pass_risk(self, sig: Signal, ctx: TickContext) -> bool:
+    def _pass_risk(self, sig: Signal, ctx: TickContext, buy_ctx: BuyContext | None) -> bool:
         try:
             if sig.action == Action.BUY:
-                self.risk.check_buy(self._build_buy_context(sig, ctx))
+                self.risk.check_buy(buy_ctx)
             elif sig.action == Action.SELL:
                 self.risk.check_sell(sig.symbol)
             else:
@@ -148,16 +187,19 @@ class TradingPipeline:
             p = ctx.current_prices.get(pos.symbol, pos.avg_price)
             existing[pos.symbol] = existing.get(pos.symbol, 0.0) + pos.qty * p
         portfolio_value = ctx.portfolio_value if ctx.portfolio_value is not None else self.portfolio.equity(ctx.cash_available, ctx.current_prices)
+        market_cap, avg_value = ctx.liquidity.get(sig.symbol, (None, None))
         return BuyContext(
             symbol=sig.symbol,
             portfolio_value=portfolio_value,
             existing_positions_notional=existing,
-            market_cap=50_000_000_000,
-            avg_volume_krw=1_000_000_000,
+            market_cap=int(market_cap) if market_cap else None,
+            avg_volume_krw=int(avg_value) if avg_value else None,
             intended_notional=sig.notional if sig.notional > 0 else None,
         )
 
-    def _execute(self, sig: Signal, ctx: TickContext, today: date) -> bool:
+    def _execute(
+        self, sig: Signal, ctx: TickContext, today: date, buy_ctx: BuyContext | None
+    ) -> bool:
         price = ctx.current_prices.get(sig.symbol, 0.0)
         if price <= 0:
             return False
@@ -173,6 +215,7 @@ class TradingPipeline:
         po = self.orders.submit(
             sig, limit_price=price, qty=qty,
             idempotency_key=idem, strategy_ver=self.strategy_ver,
+            buy_context=buy_ctx,
         )
         if po is None:
             return False

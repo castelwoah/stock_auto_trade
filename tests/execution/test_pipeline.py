@@ -1,11 +1,14 @@
 """Pipeline integration test — Registry → Risk → OrderManager → Portfolio."""
+import threading
 from datetime import datetime
 from unittest.mock import MagicMock
 
 import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session
+from sqlalchemy.pool import StaticPool
 
+from src.clients.kis import OrderAck
 from src.execution.order_manager import OrderManager
 from src.execution.pipeline import TickContext, TradingPipeline
 from src.execution.portfolio import LivePortfolio
@@ -17,6 +20,7 @@ from src.risk.limits import (
     CooldownPolicy,
     DailyLossState,
     RiskEngine,
+    set_risk_engine,
 )
 from src.risk.market_state import MarketState
 from src.risk.sizing import SizingPolicy
@@ -26,17 +30,32 @@ from src.strategy.registry import StrategyRegistry
 
 @pytest.fixture
 def session():
-    eng = create_engine("sqlite:///:memory:", future=True)
+    # 워커 스레드 테스트를 위해 단일 연결 공유
+    eng = create_engine(
+        "sqlite:///:memory:", future=True,
+        connect_args={"check_same_thread": False}, poolclass=StaticPool,
+    )
     Base.metadata.create_all(eng)
     with Session(eng) as s:
         yield s
 
 
+LIQ = {"A": (10**12, 10**10)}   # 시총 1조, 20일 평균 거래대금 100억
+
+
 def _kis():
     k = MagicMock()
-    k.order.return_value = {"output": {"ODNO": "ORD1"}}
+    k.order.return_value = OrderAck(odno="ORD1", orgno="91252")
+    k.inquire_today_orders.return_value = []
     k.get_stock_balance.return_value = ({}, {})
     return k
+
+
+def _tick(**over):
+    kw = dict(as_of=datetime(2026, 4, 20, 10), cash_available=5_000_000,
+              current_prices={"A": 1000}, liquidity=LIQ)
+    kw.update(over)
+    return TickContext(**kw)
 
 
 class _StubBuy(Strategy):
@@ -62,28 +81,108 @@ def _risk(**over):
     return RiskEngine(**defaults)
 
 
-def _pipe(session, *, risk=None, kis=None):
+def _pipe(session, *, risk=None, kis=None, strategy=None, kill_switch=None):
     kis = kis or _kis()
     lp = LivePortfolio(session)
     reg = StrategyRegistry()
-    reg.register(_StubBuy(), allocation_pct=50)
+    reg.register(strategy or _StubBuy(), allocation_pct=50)
     om = OrderManager(kis_client=kis, portfolio=lp, now_provider=lambda: datetime(2026, 4, 20, 10))
     rec = Reconciler(session, kis)
     return TradingPipeline(
         registry=reg, risk_engine=risk or _risk(),
-        order_manager=om, portfolio=lp, reconciler=rec,
+        order_manager=om, portfolio=lp, reconciler=rec, kill_switch=kill_switch,
     )
+
+
+@pytest.fixture(autouse=True)
+def _reset_engine():
+    yield
+    set_risk_engine(None)
 
 
 def test_tick_submits_buy(session):
-    pipe = _pipe(session)
-    ctx = TickContext(
-        as_of=datetime(2026, 4, 20, 10), cash_available=5_000_000,
-        current_prices={"A": 1000},
-    )
-    executed = pipe.run_tick(ctx)
+    kis = _kis()
+    pipe = _pipe(session, kis=kis)
+    executed = pipe.run_tick(_tick())
     assert len(executed) == 1
     assert executed[0].action == Action.BUY
+    assert kis.order.call_count == 1
+
+
+def test_tick_installs_engine_in_worker_thread(session):
+    """APScheduler 워커 스레드처럼 ContextVar 가 비어 있는 스레드에서도 송신 가능."""
+    kis = _kis()
+    pipe = _pipe(session, kis=kis)
+    out = []
+    t = threading.Thread(target=lambda: out.append(pipe.run_tick(_tick())))
+    t.start()
+    t.join()
+    assert len(out[0]) == 1 and kis.order.call_count == 1
+
+
+def test_missing_liquidity_blocks_buy(session):
+    from src.persistence.models import RiskEvent
+
+    kis = _kis()
+    pipe = _pipe(session, kis=kis)
+    assert pipe.run_tick(_tick(liquidity={})) == []
+    assert kis.order.call_count == 0
+    assert session.query(RiskEvent).one().action_taken == "liquidity"
+
+
+def test_kill_switch_blocks_entries(session):
+    kis = _kis()
+    pipe = _pipe(session, kis=kis, kill_switch=lambda: True)
+    assert pipe.run_tick(_tick()) == []
+    assert kis.order.call_count == 0
+
+
+def test_kill_switch_error_is_fail_closed(session):
+    def broken():
+        raise OSError("disk")
+
+    kis = _kis()
+    pipe = _pipe(session, kis=kis, kill_switch=broken)
+    assert pipe.run_tick(_tick()) == []
+    assert kis.order.call_count == 0
+
+
+class _StubSell(Strategy):
+    strategy_id = "test_sell"
+
+    def decide_entries(self, ctx):
+        return []
+
+    def decide_exits(self, ctx):
+        return [Signal(action=Action.SELL, symbol=p.symbol, strategy_id=self.strategy_id,
+                       qty=p.qty, signal_id=f"x-{p.symbol}") for p in self.owned_positions(ctx)]
+
+
+def _seed_position(session, *, symbol="A", strategy_id="test_sell", qty=10, avg=1000.0, peak=None):
+    from src.persistence.models import Position
+
+    session.add(Position(symbol=symbol, strategy_id=strategy_id, qty=qty, avg_price=avg,
+                         opened_at=datetime(2026, 4, 17, 10), highest_price=peak or avg,
+                         updated_at=datetime(2026, 4, 17, 10)))
+    session.flush()
+
+
+def test_kill_switch_still_allows_exits(session):
+    _seed_position(session)
+    kis = _kis()
+    pipe = _pipe(session, kis=kis, strategy=_StubSell(), kill_switch=lambda: True)
+    executed = pipe.run_tick(_tick())
+    assert [s.action for s in executed] == [Action.SELL]
+    assert kis.order.call_args.kwargs["side"] == "SELL"
+
+
+def test_tick_updates_highest_price(session):
+    from src.persistence.models import Position
+
+    _seed_position(session, strategy_id="test_buy", peak=1000.0)
+    pipe = _pipe(session)
+    pipe.run_tick(_tick(current_prices={"A": 1080}))
+    assert session.get(Position, ("A", "test_buy")).highest_price == 1080
 
 
 def test_tick_blocked_by_risk(session):

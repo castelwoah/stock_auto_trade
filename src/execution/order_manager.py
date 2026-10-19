@@ -1,14 +1,21 @@
-"""Order lifecycle manager — 지정가 IOC 3분 타임아웃 + 1호가 상향 재주문.
+"""Order lifecycle manager — 지정가 + 3분 미체결 시 취소 확인 후 잔량 재주문.
 
 rules §6 Step3:
-  - 진입가: 호가창 상위 2호가 이내 지정가 (슬리피지 제어)
-  - 3분 내 미체결 → 1호가 상향 재주문
-  - 2회 재시도 후 취소 + 로그
+  - 진입가: 지정가 (슬리피지 제어)
+  - 3분 내 미체결 → 1호가 조정 재주문
+  - 매수는 2회 재시도 후 취소 + 로그
 
-v2 추가:
-  - 15:00 이후 신규 매수 cut-off 강제
-  - 15:15 도달 시 미체결 신규 매수 일괄 취소 (M5)
-  - KIS cancel TR 호출은 `cancel_hook` 주입으로 확장 (현 KisClient 미구현 부분 보강)
+v4 (2026-10, 실전 직행 대비):
+  - KIS 거절(rt_cd != '0')은 rejected, 네트워크 예외는 unknown (접수됐을 수 있음)
+  - D8 송신 게이트: Trade 선기록이 신규 idempotency_key 일 때만 KIS 송신
+    → 재시작 후 같은 신호가 재생성돼도 중복 주문이 나가지 않는다
+  - 매 poll 마다 일별주문체결조회로 체결(부분 포함)을 Position 에 반영.
+    체결조회 실패 시 그 poll 의 취소·재주문 판단을 건너뛴다 (fail-safe)
+  - 재주문은 **취소 성공 + 체결 재조회 후 잔량만**. 취소 실패 시 재주문 금지 (이중 체결 방지)
+  - 가격은 KRX 호가단위. 매수 1호가 상향(MAX_RETRIES 회), 매도 1호가 하향 무제한
+    (손절이 미체결로 남지 않도록 — 결정 2026-10-19). 매도 첫 지정가는 현재가 −1%
+  - 모든 KIS 송신은 `@risk_gate` 경유 (D14). SHADOW 모드는 gate 통과 후 송신만 생략
+  - 15:00 이후 매수 재주문 금지, 15:15 미체결 매수는 실제 취소 TR 호출
 
 **서브에이전트 금지 영역** — 주문 생명주기는 체결 순서·idempotency·재시도 규약이
 강하게 결합되어 단일 논리 흐름 유지.
@@ -16,17 +23,20 @@ v2 추가:
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass, field
-from datetime import datetime, time, timedelta
+from dataclasses import dataclass, replace
+from datetime import datetime, time
 from typing import Callable
 
-from sqlalchemy import update as sa_update
+import requests
 
-from src.clients.kis import KisClient
+from src.clients.discord import DiscordNotifier
+from src.clients.kis import KisClient, KisOrderRejected, OrderAck, OrderFill
+from src.execution.krx_tick import round_to_tick, shift_ticks
 from src.execution.portfolio import LivePortfolio, TradeRecord
 from src.persistence.models import Trade
 from src.reporting.intraday import notify_risk_event
-from src.clients.discord import DiscordNotifier
+from src.risk.exceptions import RiskBlocked
+from src.risk.limits import BuyContext, risk_gate
 from src.strategy.base import Action, Signal
 
 
@@ -34,25 +44,37 @@ logger = logging.getLogger(__name__)
 
 
 # Operational constants (rules §5.1, §6 Step3)
-MAX_RETRIES = 2
+MAX_RETRIES = 2                # 매수 재주문 상한 (매도는 무제한)
 RESUBMIT_AFTER_SECONDS = 180   # 3 min
 ENTRY_CUTOFF = time(15, 0)
 EOD_CANCEL = time(15, 15)
-TICK_UP_FRACTION = 0.005       # 1호가 근사치 (대형주 ~0.5% 기준, 보수적)
+SELL_INITIAL_DISCOUNT = 0.01   # 매도 첫 지정가 = 현재가 × (1 − 1%) → 즉시 체결 지향
 
 # Trade.status 값 상수 — v3 시도 로그 정규화
 STATUS_SUBMITTED = "submitted"
 STATUS_FILLED = "filled"
 STATUS_REJECTED = "rejected"
-STATUS_CANCELLED_TIMEOUT = "cancelled_timeout"   # 재시도 한계 초과
-STATUS_CANCELLED_EOD = "cancelled_eod"           # 15:15 일괄 취소
-STATUS_CANCELLED_MANUAL = "cancelled_manual"     # 수동 취소 (향후)
+STATUS_CANCELLED_TIMEOUT = "cancelled_timeout"     # 매수 재시도 한계 초과
+STATUS_CANCELLED_EOD = "cancelled_eod"             # 15:15 일괄 취소
+STATUS_CANCELLED_MANUAL = "cancelled_manual"       # 외부(수동) 취소
+STATUS_CANCELLED_RESUBMIT = "cancelled_resubmit"   # 잔량 재주문으로 대체됨
+STATUS_UNKNOWN = "unknown"                         # 송신 결과 불명 (네트워크 예외)
+STATUS_BLOCKED = "blocked"                         # 송신 직전 risk_gate 차단
+STATUS_SHADOW = "shadow"                           # 섀도 모드 — 송신 안 함
 
 
-# Price band helpers — 호가 단위는 종목별로 다르지만 근사치로 처리
-def upward_tick(price: float, fraction: float = TICK_UP_FRACTION) -> float:
-    """Round up by ~0.5%. 실 호가 단위 적용은 향후 `kospi_code.mst` 연동."""
-    return price * (1.0 + fraction)
+def initial_price(action: Action, ref_price: float) -> int:
+    """첫 지정가: 매수는 현재가 올림 정렬, 매도는 −1% 후 내림 정렬."""
+    if action == Action.SELL:
+        return round_to_tick(ref_price * (1.0 - SELL_INITIAL_DISCOUNT), up=False)
+    return round_to_tick(ref_price, up=True)
+
+
+def reprice(action: Action, *, prev_price: float, ref_price: float) -> int:
+    """재주문가: 매수는 max(직전, 현재)+1호가, 매도는 min(직전, 현재)−1호가."""
+    if action == Action.SELL:
+        return shift_ticks(min(prev_price, ref_price), -1)
+    return shift_ticks(max(prev_price, ref_price), +1)
 
 
 @dataclass
@@ -62,17 +84,29 @@ class PendingOrder:
     submitted_at: datetime
     price: float
     qty: int
+    orgno: str = ""
     retries: int = 0
+    filled_qty: int = 0
+    avg_fill_price: float = 0.0
     cancelled: bool = False
     filled: bool = False
+    unknown: bool = False
+    cancel_requested: bool = False
+    cancel_fail_notified: bool = False
     idempotency_key: str = ""
+    buy_context: BuyContext | None = None
 
+    @property
+    def remaining(self) -> int:
+        return max(0, self.qty - self.filled_qty)
 
-CancelHook = Callable[[str], bool]   # (order_id) → success
+    @property
+    def active(self) -> bool:
+        return not (self.filled or self.cancelled)
 
 
 class OrderManager:
-    """Live order state tracker + 재시도·취소 오케스트레이터."""
+    """Live order state tracker + 체결 동기화 · 취소 · 재주문 오케스트레이터."""
 
     def __init__(
         self,
@@ -80,19 +114,21 @@ class OrderManager:
         kis_client: KisClient,
         portfolio: LivePortfolio,
         notifier: DiscordNotifier | None = None,
-        cancel_hook: CancelHook | None = None,
         now_provider: Callable[[], datetime] = datetime.now,
         max_retries: int = MAX_RETRIES,
         resubmit_after_seconds: int = RESUBMIT_AFTER_SECONDS,
+        shadow: bool = False,
     ) -> None:
         self.kis = kis_client
         self.portfolio = portfolio
         self.notifier = notifier
-        self.cancel_hook = cancel_hook
         self._now = now_provider
         self.max_retries = max_retries
         self.resubmit_after_seconds = resubmit_after_seconds
+        self.shadow = shadow
         self.pending: dict[str, PendingOrder] = {}
+        self._tracked_odnos: set[str] = set()
+        self._shadow_seq = 0
 
     # ------------------------------------------------------------------
     # Submission
@@ -105,205 +141,348 @@ class OrderManager:
         qty: int,
         idempotency_key: str,
         strategy_ver: str = "v0",
+        buy_context: BuyContext | None = None,
     ) -> PendingOrder | None:
-        """Submit a limit order. Entry cut-off at 15:00 for BUY signals."""
+        """지정가 주문. limit_price 는 기준가(현재가) — 호가 정렬·매도 할인은 여기서 적용."""
         now = self._now()
         if signal.action == Action.BUY and now.time() >= ENTRY_CUTOFF:
             logger.info("BUY after 15:00 cut-off ignored: %s", signal.symbol)
             return None
         if qty <= 0 or limit_price <= 0:
             return None
+        price = initial_price(signal.action, limit_price)
 
-        # Persistence 에 idempotency 먼저 확정 (동일 key 중복 차단)
-        trade = self.portfolio.record_trade(TradeRecord(
+        # D8 송신 게이트 — 기존 키면 송신하지 않는다
+        trade = self.portfolio.insert_trade_if_new(TradeRecord(
             symbol=signal.symbol,
             side=signal.action.value,
             qty=qty,
-            price=limit_price,
+            price=price,
             strategy_id=signal.strategy_id,
             strategy_ver=strategy_ver,
             signal_id=signal.signal_id,
             idempotency_key=idempotency_key,
             order_id=None,
-            order_dvsn="00",  # 지정가
-            status="submitted",
+            order_dvsn="00",
+            status=STATUS_SHADOW if self.shadow else STATUS_SUBMITTED,
             note=signal.reason,
         ))
+        if trade is None:
+            logger.warning("duplicate idempotency_key — order NOT sent: %s", idempotency_key)
+            return None
+        return self._send(
+            signal, trade=trade, price=price, qty=qty,
+            idempotency_key=idempotency_key, retries=0, buy_context=buy_context,
+        )
 
-        # KIS order submission (지정가)
+    def _send(
+        self,
+        signal: Signal,
+        *,
+        trade: Trade,
+        price: int,
+        qty: int,
+        idempotency_key: str,
+        retries: int,
+        buy_context: BuyContext | None,
+    ) -> PendingOrder | None:
+        now = self._now()
         try:
-            res = self.kis.order(
-                code=signal.symbol,
-                qty=qty,
-                side=signal.action.value,
-                ord_dvsn="00",
-                unit_price=str(int(limit_price)),
+            ack = self._place(
+                symbol=signal.symbol, side=signal.action.value,
+                qty=qty, price=price, buy_context=buy_context,
             )
-        except Exception:
-            logger.exception("KIS order failed: %s", signal.symbol)
-            trade.status = "rejected"
+        except RiskBlocked as rb:
+            logger.warning("risk_gate blocked at send %s: %s", signal.symbol, rb)
+            self._set_trade(trade, status=STATUS_BLOCKED, note_add=f"blocked:{rb.code}")
+            return None
+        except KisOrderRejected as rej:
+            logger.warning("KIS rejected %s: %s", signal.symbol, rej)
+            self._set_trade(trade, status=STATUS_REJECTED, note_add=f"rejected:{rej.msg_cd} {rej.msg1}")
+            return None
+        except ValueError:
+            logger.exception("order parameters invalid: %s", signal.symbol)
+            self._set_trade(trade, status=STATUS_REJECTED, note_add="invalid_params")
+            return None
+        except requests.RequestException:
+            # 타임아웃 등 — 접수됐을 수 있다. 체결조회로 대응 주문을 찾을 때까지 추적.
+            # (그 외 예외 — 예: risk_gate 엔진 미설치 — 는 fail-loud 로 전파)
+            logger.exception("order send outcome unknown: %s", signal.symbol)
+            self._set_trade(trade, status=STATUS_UNKNOWN)
+            po = PendingOrder(
+                order_id=f"unknown:{idempotency_key}", signal=signal,
+                submitted_at=now, price=price, qty=qty, retries=retries,
+                unknown=True, idempotency_key=idempotency_key, buy_context=buy_context,
+            )
+            self.pending[po.order_id] = po
             return None
 
-        order_id = self._extract_order_id(res)
-        trade.order_id = order_id
-
-        pending = PendingOrder(
-            order_id=order_id, signal=signal,
-            submitted_at=now, price=limit_price, qty=qty,
-            idempotency_key=idempotency_key,
+        po = PendingOrder(
+            order_id=ack.odno, signal=signal, submitted_at=now, price=price, qty=qty,
+            orgno=ack.orgno, retries=retries,
+            idempotency_key=idempotency_key, buy_context=buy_context,
         )
-        self.pending[order_id] = pending
-        return pending
+        if self.shadow:
+            return po   # 송신 안 함 — 생명주기 추적 대상 아님
+        trade.order_id = ack.odno
+        self.portfolio.session.flush()
+        self.pending[ack.odno] = po
+        self._tracked_odnos.add(ack.odno)
+        return po
+
+    @risk_gate
+    def _place(
+        self,
+        *,
+        symbol: str,
+        side: str,
+        qty: int,
+        price: int,
+        buy_context: BuyContext | None = None,
+    ) -> OrderAck:
+        """D14: 모든 KIS 송신의 단일 지점. 엔진 미설치 시 risk_gate 가 RuntimeError."""
+        if self.shadow:
+            self._shadow_seq += 1
+            return OrderAck(odno=f"shadow-{self._shadow_seq}", orgno="")
+        return self.kis.order(
+            code=symbol, qty=qty, side=side, ord_dvsn="00", unit_price=str(int(price)),
+        )
 
     # ------------------------------------------------------------------
     # Lifecycle ticks — call periodically (e.g., every bar)
     # ------------------------------------------------------------------
     def poll(self, *, current_prices: dict[str, float]) -> None:
-        """각 pending 주문에 대해 3분 타임아웃 · 재시도 · EOD 취소 판단.
-
-        호출 전제: 상위 pipeline 이 체결 여부를 다른 경로(예: reconciler 의 KIS
-        잔고 diff)로 파악해 `mark_filled()` 호출. 여기서는 **타이밍·재시도**만.
-        """
+        """체결 동기화 → EOD 취소 · 타임아웃 취소/재주문."""
+        if not any(po.active for po in self.pending.values()):
+            self._prune()
+            return
         now = self._now()
-        to_remove: list[str] = []
-        # snapshot: _resubmit()가 self.pending 에 새 entry 를 추가하므로
-        # iteration 중 size change 방지를 위해 리스트로 고정
-        for oid, po in list(self.pending.items()):
-            if po.filled or po.cancelled:
-                to_remove.append(oid)
+        if not self.sync_fills():
+            logger.warning("fill sync failed — skip cancel/resubmit this poll")
+            return
+        for po in list(self.pending.values()):
+            if not po.active or po.unknown:
                 continue
-            # EOD cancel (신규 매수만)
-            if po.signal.action == Action.BUY and now.time() >= EOD_CANCEL:
-                self._cancel_and_notify(po, reason="eod_cancel")
-                to_remove.append(oid)
+            is_buy = po.signal.action == Action.BUY
+            if is_buy and now.time() >= EOD_CANCEL:
+                self._cancel_and_close(po, STATUS_CANCELLED_EOD)
                 continue
-            # 3분 타임아웃 재시도
             age = (now - po.submitted_at).total_seconds()
-            if age >= self.resubmit_after_seconds:
-                if po.retries >= self.max_retries:
-                    self._cancel_and_notify(po, reason="max_retries_exceeded")
-                    to_remove.append(oid)
-                    continue
-                # 재시도: 1호가 상향 재주문. _resubmit 이 기존 po.cancelled=True 처리.
-                new_price = upward_tick(current_prices.get(po.signal.symbol, po.price))
-                self._resubmit(po, new_price=new_price)
-                to_remove.append(oid)   # 기존 entry 제거, 새 ORD 는 pending 에 추가됨
+            if age < self.resubmit_after_seconds:
                 continue
-        for oid in to_remove:
-            self.pending.pop(oid, None)
+            if is_buy and (po.retries >= self.max_retries or now.time() >= ENTRY_CUTOFF):
+                self._cancel_and_close(po, STATUS_CANCELLED_TIMEOUT)
+                continue
+            ref = current_prices.get(po.signal.symbol, po.price)
+            self._cancel_and_resubmit(po, ref_price=ref)
+        self._prune()
+
+    def sync_fills(self) -> bool:
+        """일별주문체결조회로 활성 주문의 체결 진행을 반영. 조회 실패 시 False."""
+        live = [po for po in self.pending.values() if po.active]
+        if not live:
+            return True
+        try:
+            fills = self.kis.inquire_today_orders(self._now().strftime("%Y%m%d"))
+        except Exception:
+            logger.exception("inquire_today_orders failed")
+            return False
+        by_odno = {f.odno: f for f in fills}
+        for po in live:
+            f = by_odno.get(po.order_id)
+            if f is None and po.unknown:
+                f = self._adopt_unknown(po, fills)
+            if f is not None:
+                self._apply_progress(po, f)
+        return True
+
+    def _adopt_unknown(self, po: PendingOrder, fills: list[OrderFill]) -> OrderFill | None:
+        """응답 유실 주문을 체결조회에서 찾아 연결 (종목·방향·수량 일치, 미추적 주문번호)."""
+        for f in fills:
+            if (
+                f.odno and f.odno not in self._tracked_odnos
+                and f.symbol == po.signal.symbol
+                and f.side == po.signal.action.value
+                and f.ord_qty == po.qty
+            ):
+                self.pending.pop(po.order_id, None)
+                po.order_id, po.orgno, po.unknown = f.odno, f.orgno, False
+                self.pending[f.odno] = po
+                self._tracked_odnos.add(f.odno)
+                trade = self.portfolio.get_trade(po.idempotency_key)
+                if trade is not None:
+                    self._set_trade(trade, status=STATUS_SUBMITTED, order_id=f.odno)
+                logger.info("unknown order adopted: %s → %s", po.idempotency_key, f.odno)
+                return f
+        return None
+
+    def _apply_progress(self, po: PendingOrder, f: OrderFill) -> None:
+        delta = f.filled_qty - po.filled_qty
+        if delta > 0:
+            # 누적 평균가로부터 이번 증분의 체결가 역산
+            prev_amt = po.avg_fill_price * po.filled_qty
+            px = (f.avg_price * f.filled_qty - prev_amt) / delta if f.avg_price > 0 else po.price
+            self.portfolio.apply_fill_to_position(
+                symbol=po.signal.symbol,
+                strategy_id=po.signal.strategy_id,
+                side=po.signal.action.value,
+                qty=delta,
+                price=px,
+                ts=self._now(),
+            )
+            po.filled_qty = f.filled_qty
+            po.avg_fill_price = f.avg_price if f.avg_price > 0 else px
+        if po.filled_qty >= po.qty:
+            po.filled = True
+            self._close_trade(po, STATUS_FILLED)
+        elif f.cancelled and not po.cancel_requested:
+            po.cancelled = True
+            self._close_trade(po, STATUS_CANCELLED_MANUAL)
 
     # ------------------------------------------------------------------
-    # External confirmation (체결/취소 결과가 들어왔을 때)
+    # External confirmation (수동 경로 — 테스트·운영자 개입)
     # ------------------------------------------------------------------
     def mark_filled(self, order_id: str, *, fill_price: float, ts: datetime | None = None) -> None:
         po = self.pending.get(order_id)
-        if po is None:
+        if po is None or not po.active:
             return
-        po.filled = True
+        qty = po.remaining
         self.portfolio.apply_fill_to_position(
             symbol=po.signal.symbol,
             strategy_id=po.signal.strategy_id,
             side=po.signal.action.value,
-            qty=po.qty,
+            qty=qty,
             price=fill_price,
             ts=ts or self._now(),
         )
-        # Trade.status 를 filled 로 갱신 (v3 실패·성공 리포트 근거 자료)
-        self._update_trade_status(po.idempotency_key, STATUS_FILLED)
+        total = po.avg_fill_price * po.filled_qty + fill_price * qty
+        po.filled_qty += qty
+        po.avg_fill_price = total / po.filled_qty
+        po.filled = True
+        self._close_trade(po, STATUS_FILLED)
 
     def mark_cancelled(self, order_id: str, *, status: str = STATUS_CANCELLED_MANUAL) -> None:
         po = self.pending.get(order_id)
-        if po is not None:
+        if po is not None and po.active:
             po.cancelled = True
-            self._update_trade_status(po.idempotency_key, status)
+            self._close_trade(po, status)
 
     # ------------------------------------------------------------------
     # Internals
     # ------------------------------------------------------------------
-    def _resubmit(self, po: PendingOrder, *, new_price: float) -> None:
-        # 기존 주문 취소
-        if self.cancel_hook is not None:
-            try:
-                self.cancel_hook(po.order_id)
-            except Exception:
-                logger.exception("cancel hook failed for %s", po.order_id)
-        po.cancelled = True
-
-        # 새 키: 재시도 횟수를 suffix 로 붙여 idempotency 유지
-        retry_idem = f"{po.idempotency_key}#r{po.retries + 1}"
+    def _cancel(self, po: PendingOrder) -> bool:
+        po.cancel_requested = True
         try:
-            res = self.kis.order(
-                code=po.signal.symbol,
-                qty=po.qty,
-                side=po.signal.action.value,
-                ord_dvsn="00",
-                unit_price=str(int(new_price)),
-            )
-        except Exception:
-            logger.exception("resubmit KIS order failed: %s", po.signal.symbol)
+            self.kis.cancel_order(po.order_id, po.orgno)
+            return True
+        except Exception as exc:
+            logger.exception("cancel failed for %s %s", po.signal.symbol, po.order_id)
+            if self.notifier is not None and not po.cancel_fail_notified:
+                po.cancel_fail_notified = True
+                notify_risk_event(
+                    self.notifier,
+                    event_type="order_cancel_failed",
+                    symbol=po.signal.symbol,
+                    detail=f"{po.signal.action.value} {po.order_id}: {exc} — 재주문 보류",
+                )
+            return False
+
+    def _cancel_and_close(self, po: PendingOrder, status: str) -> None:
+        if not self._cancel(po):
+            return  # 다음 poll 에서 재시도
+        self.sync_fills()  # 취소 직전 체결분 반영
+        if po.active:
+            po.cancelled = True
+            self._close_trade(po, status)
+        logger.info("order cancelled: %s %s → %s", po.signal.symbol, po.order_id, status)
+
+    def _cancel_and_resubmit(self, po: PendingOrder, *, ref_price: float) -> None:
+        if not self._cancel(po):
+            return  # 취소 미확인 상태에서 재주문하면 이중 체결 위험
+        self.sync_fills()
+        if not po.active:
+            return  # 취소 직전 전량 체결
+        po.cancelled = True
+        self._close_trade(po, STATUS_CANCELLED_RESUBMIT)
+        remaining = po.remaining
+        if remaining <= 0:
             return
-        new_id = self._extract_order_id(res)
-        new_po = PendingOrder(
-            order_id=new_id, signal=po.signal,
-            submitted_at=self._now(), price=new_price, qty=po.qty,
-            retries=po.retries + 1,
-            idempotency_key=retry_idem,
+        action = po.signal.action
+        new_price = reprice(action, prev_price=po.price, ref_price=ref_price)
+        retry_no = po.retries + 1
+        retry_key = f"{po.idempotency_key.split('#r')[0]}#r{retry_no}"
+        trade = self.portfolio.insert_trade_if_new(TradeRecord(
+            symbol=po.signal.symbol,
+            side=action.value,
+            qty=remaining,
+            price=new_price,
+            strategy_id=po.signal.strategy_id,
+            strategy_ver="retry",
+            signal_id=po.signal.signal_id,
+            idempotency_key=retry_key,
+            order_id=None,
+            status=STATUS_SUBMITTED,
+            note=f"retry {retry_no} of {po.idempotency_key}",
+        ))
+        if trade is None:
+            return
+        ctx = po.buy_context
+        if action == Action.BUY and ctx is not None:
+            ctx = replace(ctx, intended_notional=remaining * new_price)
+        new_po = self._send(
+            po.signal, trade=trade, price=new_price, qty=remaining,
+            idempotency_key=retry_key, retries=retry_no, buy_context=ctx,
         )
-        self.pending[new_id] = new_po
-        if self.notifier is not None:
+        if new_po is not None and self.notifier is not None:
             notify_risk_event(
                 self.notifier,
                 event_type="order_resubmit",
                 symbol=po.signal.symbol,
-                detail=f"retry {new_po.retries}/{self.max_retries} at {new_price:.0f}",
+                detail=f"{action.value} retry {retry_no} qty={remaining} at {new_price}",
             )
 
-    def _cancel_and_notify(self, po: PendingOrder, *, reason: str) -> None:
-        if self.cancel_hook is not None:
-            try:
-                self.cancel_hook(po.order_id)
-            except Exception:
-                logger.exception("cancel hook failed for %s", po.order_id)
-        po.cancelled = True
-        # Trade.status 갱신 — 리포트용 분류 (v3)
-        status_map = {
-            "max_retries_exceeded": STATUS_CANCELLED_TIMEOUT,
-            "eod_cancel": STATUS_CANCELLED_EOD,
-        }
-        self._update_trade_status(
-            po.idempotency_key, status_map.get(reason, STATUS_CANCELLED_MANUAL)
-        )
-        # NOTE: v3 결정 3-(a) — intraday Discord 알림은 과다 방지 위해 미발송.
-        # 실패·차단은 daily/midday 리포트에서 집계로 전달.
-        logger.info(
-            "order cancelled: %s %s reason=%s", po.signal.symbol, po.order_id, reason
-        )
-
-    def _update_trade_status(self, idempotency_key: str, status: str) -> None:
-        """Trade.status 갱신. 본 OrderManager 는 portfolio 의 session 을 공유."""
-        if not idempotency_key:
+    def _close_trade(self, po: PendingOrder, status: str) -> None:
+        """주문 종료 시 Trade 확정. 체결분이 있으면 체결 수량·평균가로 'filled' 기록
+        (리포트 FIFO 손익은 status='filled' 행의 qty·price 를 사용)."""
+        trade = self.portfolio.get_trade(po.idempotency_key)
+        if trade is None:
             return
-        try:
-            self.portfolio.session.execute(
-                sa_update(Trade)
-                .where(Trade.idempotency_key == idempotency_key)
-                .values(status=status)
+        if po.filled_qty > 0:
+            note = None
+            if po.filled_qty < po.qty:
+                note = f"partial {po.filled_qty}/{po.qty}, rest {status}"
+            self._set_trade(
+                trade, status=STATUS_FILLED, qty=po.filled_qty,
+                price=po.avg_fill_price or po.price, note_add=note,
             )
+        else:
+            self._set_trade(trade, status=status)
+
+    def _set_trade(
+        self,
+        trade: Trade,
+        *,
+        status: str | None = None,
+        qty: int | None = None,
+        price: float | None = None,
+        order_id: str | None = None,
+        note_add: str | None = None,
+    ) -> None:
+        try:
+            if status is not None:
+                trade.status = status
+            if qty is not None:
+                trade.qty = qty
+            if price is not None:
+                trade.price = price
+            if order_id is not None:
+                trade.order_id = order_id
+            if note_add:
+                trade.note = f"{trade.note} | {note_add}" if trade.note else note_add
             self.portfolio.session.flush()
         except Exception:
-            logger.exception("failed to update Trade.status for %s", idempotency_key)
+            logger.exception("failed to update Trade %s", trade.idempotency_key)
 
-    @staticmethod
-    def _extract_order_id(kis_response: dict) -> str:
-        """KIS order response 의 주문번호 추출.
-
-        응답 스키마 가정: `{"output": {"ODNO": "0000012345"}}` 또는
-        `{"output": {"KRX_FWDG_ORD_ORGNO": "..", "ODNO": "..."}}`. 실제 운영에서
-        TR spec 확인 후 보강 필요.
-        """
-        out = (kis_response or {}).get("output") or {}
-        odno = out.get("ODNO") or out.get("odno") or ""
-        if not odno:
-            # fallback: timestamp 로 유니크 키 생성 (로컬 추적용)
-            odno = f"local-{datetime.now().strftime('%Y%m%d%H%M%S%f')}"
-        return str(odno)
+    def _prune(self) -> None:
+        for oid in [k for k, po in self.pending.items() if not po.active]:
+            self.pending.pop(oid, None)

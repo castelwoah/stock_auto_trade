@@ -14,13 +14,26 @@ from typing import Iterable
 
 from sqlalchemy import select
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from src.persistence.models import Position, Trade
 from src.strategy.base import PositionState
+from src.strategy.exit_signals import should_arm_trailing
 
 
 logger = logging.getLogger(__name__)
+
+
+def _tp_armed(avg_price: float, highest_price: float | None) -> bool:
+    """D3: Trailing 무장 여부를 영속된 고점에서 유도 (스키마 변경 없음).
+
+    고점은 단조 증가하고 무장은 한 번 되면 유지되므로(`update_peak`),
+    "고점이 진입가 대비 +TP% 이상이었다" 와 동치다.
+    """
+    if not highest_price or avg_price <= 0:
+        return False
+    return should_arm_trailing(avg_price, highest_price)
 
 
 @dataclass(frozen=True)
@@ -66,7 +79,7 @@ class LivePortfolio:
                 current_price=cur,
                 highest_price=r.highest_price,
                 opened_at=r.opened_at,
-                tp_armed=False,   # Position 테이블에 tp_armed 필드 없음 — in-memory flag
+                tp_armed=_tp_armed(r.avg_price, r.highest_price),
             )
         return out
 
@@ -98,6 +111,54 @@ class LivePortfolio:
         self.session.add(trade)
         self.session.flush()
         return trade
+
+    def insert_trade_if_new(self, rec: TradeRecord) -> Trade | None:
+        """D8 송신 게이트: 신규 idempotency_key 일 때만 Trade 를 만들고 반환.
+
+        이미 있으면 None — 호출측은 KIS 주문을 **보내지 않는다** (재시작 중복 송신 차단).
+        동시 삽입 경합은 UNIQUE 제약 위반을 savepoint 안에서 흡수한다.
+        """
+        if self.get_trade(rec.idempotency_key) is not None:
+            return None
+        trade = Trade(
+            symbol=rec.symbol,
+            side=rec.side,
+            qty=rec.qty,
+            price=rec.price,
+            order_id=rec.order_id,
+            order_dvsn=rec.order_dvsn,
+            strategy_id=rec.strategy_id,
+            strategy_ver=rec.strategy_ver,
+            signal_id=rec.signal_id,
+            idempotency_key=rec.idempotency_key,
+            status=rec.status,
+            note=rec.note,
+        )
+        try:
+            with self.session.begin_nested():
+                self.session.add(trade)
+                self.session.flush()
+        except IntegrityError:
+            logger.warning("idempotency race lost: %s", rec.idempotency_key)
+            return None
+        return trade
+
+    def get_trade(self, idempotency_key: str) -> Trade | None:
+        return self.session.execute(
+            select(Trade).where(Trade.idempotency_key == idempotency_key)
+        ).scalar_one_or_none()
+
+    def executed_signal_ids(self, day_start: datetime, day_end: datetime) -> list[str]:
+        """registry 복원용: 해당 일자에 실제 송신(또는 시도)된 signal_id. shadow 제외."""
+        rows = self.session.execute(
+            select(Trade.signal_id).where(
+                Trade.ts >= day_start,
+                Trade.ts <= day_end,
+                Trade.signal_id.is_not(None),
+                Trade.status != "shadow",
+            )
+        ).scalars().all()
+        return sorted({r for r in rows if r})
 
     def apply_fill_to_position(
         self,

@@ -136,3 +136,58 @@ def test_mark_halt(session):
     lp.mark_halt("A", "x")
     pos = session.get(Position, ("A", "x"))
     assert pos.halt_flag is True
+
+
+# --- v4: 송신 게이트 · 복원 · Trailing 무장 유도 -------------------------------
+
+def _rec(key, *, signal_id="s1", status="submitted"):
+    return TradeRecord(
+        symbol="A", side="BUY", qty=10, price=1000.0, strategy_id="news_swing",
+        strategy_ver="v1", signal_id=signal_id, idempotency_key=key, order_id=None,
+        status=status,
+    )
+
+
+def test_insert_trade_if_new_returns_none_on_duplicate(session):
+    lp = LivePortfolio(session)
+    assert lp.insert_trade_if_new(_rec("k1")) is not None
+    assert lp.insert_trade_if_new(_rec("k1")) is None
+    assert session.query(Trade).count() == 1
+
+
+def test_insert_trade_if_new_absorbs_unique_race(session, monkeypatch):
+    lp = LivePortfolio(session)
+    lp.insert_trade_if_new(_rec("k1"))
+    monkeypatch.setattr(lp, "get_trade", lambda key: None)   # 경합: 사전 조회는 통과
+    assert lp.insert_trade_if_new(_rec("k1")) is None
+    assert session.query(Trade).count() == 1
+
+
+def test_executed_signal_ids_excludes_shadow(session):
+    lp = LivePortfolio(session)
+    lp.insert_trade_if_new(_rec("k1", signal_id="real-1"))
+    lp.insert_trade_if_new(_rec("k2", signal_id="shadow-1", status="shadow"))
+    lp.insert_trade_if_new(_rec("k3", signal_id=None))
+    ids = lp.executed_signal_ids(datetime(2000, 1, 1), datetime(2999, 1, 1))
+    assert ids == ["real-1"]
+
+
+@pytest.mark.parametrize("peak,armed", [(None, False), (1000.0, False), (1069.0, False),
+                                        (1070.0, True), (1200.0, True)])
+def test_positions_as_state_derives_tp_armed(session, peak, armed):
+    session.add(Position(symbol="A", strategy_id="breakout", qty=1, avg_price=1000.0,
+                         highest_price=peak, updated_at=datetime(2026, 1, 1)))
+    session.flush()
+    st = LivePortfolio(session).positions_as_state(current_prices={"A": 1000.0})
+    assert st["A"].tp_armed is armed
+
+
+def test_trailing_stop_fires_from_persisted_peak(session):
+    """재시작 후에도: 고점 1,100(+10%) 영속 → 현재가 1,060(고점 −3.6%) → trailing_stop."""
+    from src.strategy.exit_signals import evaluate_exit
+
+    session.add(Position(symbol="A", strategy_id="breakout", qty=1, avg_price=1000.0,
+                         highest_price=1100.0, updated_at=datetime(2026, 1, 1)))
+    session.flush()
+    st = LivePortfolio(session).positions_as_state(current_prices={"A": 1060.0})["A"]
+    assert evaluate_exit(st).reason == "trailing_stop"

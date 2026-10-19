@@ -40,7 +40,8 @@ def main() -> int:
         cwd=ROOT, capture_output=True, text=True, timeout=180,
     )
     if proc.returncode not in (0, 5):  # 5 = no tests collected
-        tail = "\n".join(proc.stdout.strip().splitlines()[-25:])
+        out = (proc.stdout.strip() + "\n" + proc.stderr.strip()).strip()
+        tail = "\n".join(out.splitlines()[-25:])
         print(f"[run_layer_tests] {target} 실패:\n{tail}", file=sys.stderr)
         return 2
     return 0
