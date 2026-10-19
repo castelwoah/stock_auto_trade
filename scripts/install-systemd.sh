@@ -6,8 +6,8 @@
 # ============================================================
 set -euo pipefail
 
-PROJECT_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-OPS_DIR="$PROJECT_ROOT/ops"
+# shellcheck source=_ops_common.sh
+source "$(dirname "$0")/_ops_common.sh"
 TARGET=/etc/systemd/system
 
 UNITS=(
@@ -21,16 +21,23 @@ if [[ $EUID -ne 0 ]]; then
     echo "ERROR: sudo 권한이 필요합니다. 'sudo bash $0' 로 실행하세요." >&2
     exit 1
 fi
+if [[ ! -x "$PYTHON" ]]; then
+    echo "ERROR: $PYTHON 이 없습니다. 먼저 'bash scripts/setup-dev.sh' 로 .venv 를 만드세요." >&2
+    exit 1
+fi
+echo "  PROJECT_ROOT=$PROJECT_ROOT  RUN_USER=$RUN_USER:$RUN_GROUP  PYTHON=$PYTHON"
 
-echo "[1/5] logs 디렉터리 확인"
-mkdir -p "$PROJECT_ROOT/logs"
-chown -R mycom:mycom "$PROJECT_ROOT/logs"
+echo "[1/5] logs · run 디렉터리 확인 (run/ 은 킬 스위치 파일 위치)"
+mkdir -p "$PROJECT_ROOT/logs" "$PROJECT_ROOT/run"
+chown -R "$RUN_USER:$RUN_GROUP" "$PROJECT_ROOT/logs" "$PROJECT_ROOT/run"
 
-echo "[2/5] systemd 유닛 파일 복사 → $TARGET"
+echo "[2/5] systemd 유닛 렌더링 → $TARGET"
 for u in "${UNITS[@]}"; do
-    cp -f "$OPS_DIR/$u" "$TARGET/$u"
+    render "$OPS_DIR/$u" "$TARGET/$u"
     echo "  - $u"
 done
+systemd-analyze verify "$TARGET/mini-trading.service" || {
+    echo "ERROR: 유닛 검증 실패" >&2; exit 1; }
 
 echo "[3/5] systemctl daemon-reload"
 systemctl daemon-reload

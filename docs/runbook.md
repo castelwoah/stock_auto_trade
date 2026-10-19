@@ -10,9 +10,23 @@
 - **운영자**: kevin@aivelabs.com
 - **Discord 채널**: Webhook 전용 (수신 전용, 회신 불가)
 - **KIS 고객센터**: 1588-0030 (영업일 08:30 ~ 17:00)
-- **Runbook 위치**: `/home/mycom/workspace/mini_project/docs/runbook.md`
-- **메인 스크립트**: `/home/mycom/workspace/mini_project/stock_auto_trading.py`
-- **설정 파일**: `/home/mycom/workspace/mini_project/config.yaml` (민감정보, git 제외)
+- **`$PROJECT_ROOT`**: 저장소 경로 (현재 `/home/amoll/workspace/stock_auto_trade`)
+- **Runbook 위치**: `$PROJECT_ROOT/docs/runbook.md`
+- **데몬**: `$PROJECT_ROOT/.venv/bin/python -m src.main` (systemd `mini-trading.service`)
+- **설정 파일**: `$PROJECT_ROOT/config.yaml` (민감정보, git 제외)
+
+#### 1.1 실전 운용 스위치 (Phase A, 2026-10)
+
+| 설정 (`config.yaml` 또는 ENV) | 기본값 | 의미 |
+|---|---|---|
+| `SHADOW_MODE` | `true` | 전 파이프라인·리스크 게이트를 돌리되 **KIS 주문 송신만 생략** (`Trade.status='shadow'`). 실주문은 `false` 로 바꾸고 재시작 |
+| `MAX_DEPLOY_PCT` | `5.0` | 09:00 평가액 대비 **전체 투입 상한** %. 미체결 매수 포함, 초과 매수는 `capital_cap` 차단 |
+| `TRADING_DISABLED` | `false` | 킬 스위치 (재시작 필요) |
+| `KILL_SWITCH_FILE` | `run/TRADING_DISABLED` | **파일이 존재하면 즉시 신규 매수 차단** (재시작 불필요, 청산은 계속) |
+| `ALLOC_BREAKOUT_PCT` / `ALLOC_NEWS_SWING_PCT` | `20` / `0` | 전략별 현금 배분 % |
+| `RECONCILE_MANAGED_ONLY` | `false` | `true` 면 봇이 다룬 종목만 잔고 대조 (수동 보유 종목이 있는 계좌) |
+
+긴급 매수 중단: `touch $PROJECT_ROOT/run/TRADING_DISABLED` → 해제: `rm $PROJECT_ROOT/run/TRADING_DISABLED`
 
 ---
 
@@ -39,10 +53,10 @@
 
 - **징후**: Discord 에 `token fetch failed` 또는 HTTP 401 응답이 빈발.
 - **즉시 조치**:
-  1. `sudo systemctl stop mini-trading` 실행 (또는 `pkill -f stock_auto_trading.py`).
+  1. `sudo systemctl stop mini-trading` 실행 (또는 `pkill -f "src.main"`).
   2. 추가 401 로그가 없는지 확인.
 - **복구**:
-  1. `KIS{YYYYMMDD}` 캐시 파일 삭제 (`rm /home/mycom/workspace/mini_project/KIS$(date +%Y%m%d)`).
+  1. `KIS{YYYYMMDD}` 캐시 파일 삭제 (`rm $PROJECT_ROOT/KIS$(date +%Y%m%d)`).
   2. `sudo systemctl start mini-trading` 로 재시작.
   3. Discord 에 `token issued` 알림이 오는지 확인.
 - **사후 점검**:
@@ -55,11 +69,13 @@
 #### 3.2 ⚠️ 네트워크 단절 / DNS 실패
 
 - **징후**: `connection timeout`, `Name or service not known` 로그 다수.
-- **즉시 조치**: 소프트웨어 내장 **5분 쿨다운**이 자동 적용됨. 대기.
+- **즉시 조치**: 별도 쿨다운 없음 — 실패한 tick 은 건너뛰고 **다음 5분 tick 에서 재시도**한다.
+  오류 알림은 30분에 1회로 제한된다. 주문 송신 중 타임아웃은 `unknown` 으로 기록되고,
+  복구 후 체결조회로 실제 접수 여부를 찾아 연결한다 (중복 송신 없음).
 - **복구**:
-  1. 30분 누적 실패 시 **매매 전면 OFF**.
-  2. `config.yaml` 에 `TRADING_DISABLED=true` 추가 후 재시작.
-  3. 네트워크 복구 확인(`ping openapi.koreainvestment.com`) 후 플래그 해제 및 재시작.
+  1. 장시간 단절이 예상되면 `touch $PROJECT_ROOT/run/TRADING_DISABLED` 로 신규 매수 차단.
+  2. 네트워크 복구 확인(`ping openapi.koreainvestment.com`) 후 `rm $PROJECT_ROOT/run/TRADING_DISABLED`.
+  3. 다음 09:00 Reconcile 결과(Discord `[prepare]` 메시지) 확인.
 - **사후 점검**:
   - ISP / 라우터 / DNS 서버 로그 확인.
   - 장시간 단절 구간의 미실행 주문 영향도 기록.
@@ -72,7 +88,8 @@
 - **즉시 조치**: **KIS MTS 앱**에서 실제 잔고를 직접 확인 (육안 검증).
 - **복구**:
   1. DB `positions` 테이블을 KIS 실제 잔고와 수동 일치.
-  2. `python scripts/resume_trading.py` 실행 (스크립트 미존재 시 `TRADING_DISABLED` 플래그 해제 후 재시작).
+  2. `sudo systemctl restart mini-trading` — 재기동 시 prepare 가 Reconcile 을 다시 수행한다
+     (수동 보유 종목이 원인이면 `RECONCILE_MANAGED_ONLY: true` 검토).
   3. `reconciler.verify()` 재통과 확인.
 - **사후 점검**:
   - 주문 체결 로그 · API 응답 타임스탬프 순서 추적.

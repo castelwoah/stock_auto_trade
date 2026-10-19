@@ -10,6 +10,8 @@ if [[ $EUID -ne 0 ]]; then
     exit 1
 fi
 
+# shellcheck source=_ops_common.sh
+source "$(dirname "$0")/_ops_common.sh"
 TARGET=/etc/systemd/system
 UNITS=(
     "mini-trading.service"
@@ -32,9 +34,9 @@ systemctl daemon-reload
 
 echo "[3/4] 사용자 crontab 에서 mini-trading 블록 제거"
 TMPFILE=$(mktemp)
-sudo -u mycom crontab -l 2>/dev/null > "$TMPFILE" || true
+sudo -u "$RUN_USER" crontab -l 2>/dev/null > "$TMPFILE" || true
 sed -i '/# >>> mini-trading >>>/,/# <<< mini-trading <<</d' "$TMPFILE"
-sudo -u mycom crontab "$TMPFILE"
+sudo -u "$RUN_USER" crontab "$TMPFILE"
 rm -f "$TMPFILE"
 
 echo "[4/4] 정리 완료"

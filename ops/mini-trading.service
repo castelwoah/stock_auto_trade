@@ -1,25 +1,27 @@
+# 템플릿 — @PROJECT_ROOT@ / @RUN_USER@ / @RUN_GROUP@ / @PYTHON@ 는
+# scripts/install-systemd.sh 가 설치 시점에 실제 값으로 치환한다.
 [Unit]
 Description=KIS Auto-Trading Daemon (mini-trading)
-Documentation=file:///home/mycom/workspace/mini_project/docs/scheduling.md
-Documentation=file:///home/mycom/workspace/mini_project/docs/runbook.md
+Documentation=file://@PROJECT_ROOT@/docs/scheduling.md
+Documentation=file://@PROJECT_ROOT@/docs/runbook.md
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
-User=mycom
-Group=mycom
-WorkingDirectory=/home/mycom/workspace/mini_project
+User=@RUN_USER@
+Group=@RUN_GROUP@
+WorkingDirectory=@PROJECT_ROOT@
 
-# PATH 는 Python 실행 파일 위치 우선. conda 환경 사용 중.
-Environment="PATH=/home/mycom/miniconda3/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+# PATH 는 프로젝트 venv 우선 (scripts/setup-dev.sh 로 생성한 .venv)
+Environment="PATH=@PROJECT_ROOT@/.venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 Environment="PYTHONUNBUFFERED=1"
 Environment="TZ=Asia/Seoul"
 
 # 설정 우선순위 (D10): ENV > .env > config.yaml. 필요 시 ENV 로 오버라이드.
 # Environment="KIS_ENV=PAPER"
 
-ExecStart=/home/mycom/miniconda3/bin/python3 -m src.main
+ExecStart=@PYTHON@ -m src.main
 
 # 크래시 시 자동 복구 (Phase 4 실자본 단계의 핵심)
 Restart=on-failure
@@ -30,8 +32,8 @@ KillSignal=SIGTERM
 TimeoutStopSec=60
 
 # 로그 — journald 로 통합 (journalctl -u mini-trading) + 파일에도 append
-StandardOutput=append:/home/mycom/workspace/mini_project/logs/main.log
-StandardError=append:/home/mycom/workspace/mini_project/logs/main.err
+StandardOutput=append:@PROJECT_ROOT@/logs/main.log
+StandardError=append:@PROJECT_ROOT@/logs/main.err
 SyslogIdentifier=mini-trading
 
 # 보안 강화 (rules §11.1 권장)
@@ -39,7 +41,7 @@ NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=full
 ProtectHome=read-only
-ReadWritePaths=/home/mycom/workspace/mini_project
+ReadWritePaths=@PROJECT_ROOT@
 
 [Install]
 WantedBy=multi-user.target

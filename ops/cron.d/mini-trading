@@ -1,13 +1,13 @@
 # ============================================================
 # mini-trading — 부가 작업 (백업·로그 퍼지·헬스체크)
 # 데몬 생명주기는 systemd 가 담당 (mini-trading*.timer)
-# 설치: scripts/install-crontab.sh (사용자 crontab 에 추가)
+# 설치: scripts/install-crontab.sh (사용자 crontab 에 추가, @PROJECT_ROOT@ 치환)
 # ============================================================
 
 SHELL=/bin/bash
 PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 MAILTO=""
-PROJECT_ROOT=/home/mycom/workspace/mini_project
+PROJECT_ROOT=@PROJECT_ROOT@
 
 # ── 일별 백업 ──────────────────────────────────────────────
 

@@ -18,9 +18,9 @@
 
 ### 검증 방법 (새 세션 시작 직후 실행)
 ```bash
-cd /home/mycom/workspace/mini_project
-python3 -m pytest tests/ 2>&1 | tail -3              # 477 passed
-python3 -m src.main --dry-run 2>&1 | tail -3         # 7 jobs registered
+cd /home/amoll/workspace/stock_auto_trade
+.venv/bin/python -m pytest -q 2>&1 | tail -1          # 전체 pass (2026-10-19 기준 636)
+.venv/bin/python -m src.main --dry-run 2>&1 | tail -3 # 7 jobs registered (config.yaml 필요)
 git log --oneline -5                                 # 12개 커밋 확인
 ```
 
@@ -86,7 +86,7 @@ cat config.yaml                      # APP_KEY/APP_SECRET/CANO/ACNT_PRDT_CD/URL_
 # 추가 설정 필요:
 #   DART_API_KEY: xxx      (news_collect 선결)
 #   KIS_ENV: PAPER          (D11)
-#   ARCHIVE_ROOT: /home/mycom/workspace/mini_project/reports  (v3.1 추가, 기본값 있음)
+#   ARCHIVE_ROOT: <PROJECT_ROOT>/reports  (v3.1 추가, 기본값 있음)
 ```
 
 ### 3.2 KIS 관련 확인 (사용자 직접)

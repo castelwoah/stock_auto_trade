@@ -25,14 +25,15 @@
 timedatectl | grep "Time zone"
 # 다르면: sudo timedatectl set-timezone Asia/Seoul
 
-# Python 경로 확인
-which python3
-# /home/mycom/miniconda3/bin/python3 와 다르면 ops/mini-trading.service 의 ExecStart 수정
+# Python 환경: 프로젝트 .venv (없으면 생성)
+bash scripts/setup-dev.sh
+# ops/*.service 는 템플릿 — install-systemd.sh 가 @PROJECT_ROOT@ / @RUN_USER@ / @PYTHON@ 를
+# 실제 값(저장소 위치, sudo 실행 사용자, .venv/bin/python)으로 치환해 설치한다
 ```
 
 ### systemd 설치
 ```bash
-cd ~/workspace/mini_project
+cd "$PROJECT_ROOT"            # 예: /home/amoll/workspace/stock_auto_trade
 sudo bash scripts/install-systemd.sh
 ```
 
@@ -142,10 +143,10 @@ journalctl -u mini-trading -n 20 | grep KIS_ENV
 
 ## 7. 보안·권한 정리
 
-- `mini-trading.service` 의 `User=mycom` — root 로 실행하지 않음
+- `mini-trading.service` 의 `User=@RUN_USER@` (설치한 sudo 사용자) — root 로 실행하지 않음
 - `ProtectHome=read-only` — 다른 디렉터리 쓰기 금지
-- `ReadWritePaths=/home/mycom/workspace/mini_project` — 본 프로젝트만 쓰기 허용
-- crontab 도 mycom 사용자 권한
+- `ReadWritePaths=@PROJECT_ROOT@` — 본 프로젝트만 쓰기 허용
+- crontab 도 같은 사용자 권한
 - `config.yaml` 권한: `chmod 600 config.yaml` (소유자만 읽기) 권장
 
 ## 8. 제거 (필요 시)
@@ -196,7 +197,8 @@ sudo bash scripts/install-systemd.sh   # 멱등 — 재실행 안전
 ```bash
 # 신규 서버에서
 git clone <repo>
-cd mini_project
+cd stock_auto_trade
+bash scripts/setup-dev.sh
 # config.yaml 복사
 sudo bash scripts/install-systemd.sh
 bash scripts/install-crontab.sh
