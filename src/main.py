@@ -5,9 +5,9 @@ Wires up all layers:
   risk engine → execution pipeline → scheduler.
 
 Startup sequence:
-  1. Validate config (pydantic Settings)
-  2. init_db() (dev)
-  3. Install risk engine (ContextVar)
+  1. Validate config (pydantic Settings — KIS_ENV ↔ URL_BASE 불일치 시 abort)
+  2. init_db() (dev, --init-db)
+  3. TradingRuntime 생성 (risk engine 은 tick 마다 해당 스레드에 설치)
   4. Register scheduler jobs
   5. Install SIGINT/SIGTERM handlers (graceful shutdown)
   6. Block on scheduler until signal
@@ -20,20 +20,18 @@ import signal
 import sys
 import threading
 import time
-from datetime import datetime
-
-from datetime import date
 
 from src.clients.discord import DiscordNotifier
 from src.clients.kis import KisClient
+from src.common.clock import now_kst, today_kst
 from src.config import get_settings
 from src.persistence.db import init_db, session_scope
 from src.reporting.archiver import Archiver
 from src.reporting.builders import build_daily_report, build_midday_snapshot
 from src.reporting.daily_report import send_daily_report
 from src.reporting.midday_report import in_valid_window, send_midday_report
+from src.runtime import TradingRuntime
 from src.scheduler.app import TradingScheduler, register_default_jobs
-from src.common.clock import now_kst, today_kst
 
 
 def _setup_logging() -> None:
@@ -43,13 +41,13 @@ def _setup_logging() -> None:
     )
 
 
-def _make_job_handlers(settings, kis, notifier):
-    """Job bodies — 실제 구현은 placeholder (stub).
+def _make_job_handlers(settings, kis, notifier, runtime):
+    """Job bodies.
 
-    전체 실구현은 Phase 3 실주행 단계에서 점진 채움. 현재는:
-      - 스케줄러가 정시에 호출되는지 확인 가능 (로그)
-      - midday_report 는 방어 윈도우 체크 후 빈 스냅샷으로 Discord 전송 시도
-      - 실 DB/KIS 데이터 수집은 Phase 3 에서 보강
+    - prepare_state / trading_tick: TradingRuntime (실구현, Phase A)
+    - midday_report / daily_report: DB 기반 리포트 (v3.1)
+    - master_refresh / news_collect / analyze_score: stub (Phase C)
+    모든 핸들러는 예외를 삼키고 알린다 — 한 job 실패가 스케줄러를 멈추지 않게.
     """
     def master_refresh():
         logging.info("[job] master_refresh (stub) — re-download kospi/kosdaq mst")
@@ -61,11 +59,19 @@ def _make_job_handlers(settings, kis, notifier):
         logging.info("[job] analyze_score (stub) — compute factor scores")
 
     def prepare_state():
-        logging.info("[job] prepare_state — reconcile KIS↔DB at 09:00")
-        # 실제 Reconciler.verify_with_grace() 호출은 pipeline 주입 후 활성
+        logging.info("[job] prepare_state — reconcile KIS↔DB, start equity, daily data")
+        try:
+            runtime.prepare()
+        except Exception as exc:
+            logging.exception("prepare_state failed")
+            runtime.notify_error("prepare_state", exc)
 
     def trading_tick():
-        logging.info("[job] trading_tick at %s", now_kst().time())
+        try:
+            runtime.tick()
+        except Exception as exc:
+            logging.exception("trading_tick failed")
+            runtime.notify_error("trading_tick", exc)
 
     def midday_report():
         now = now_kst()
@@ -103,6 +109,8 @@ def _make_job_handlers(settings, kis, notifier):
         except Exception:
             logging.exception("daily_report failed")
             notifier.send(f"[main] daily_report 실패: {now_kst().isoformat()}")
+        finally:
+            runtime.close()   # 당일 세션·상태 정리 (다음 영업일 09:00 에 새로 준비)
 
     return {
         "master_refresh": master_refresh,
@@ -123,7 +131,11 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     settings = get_settings()
-    logging.info("KIS_ENV=%s URL=%s", settings.KIS_ENV.value, settings.URL_BASE)
+    logging.info(
+        "KIS_ENV=%s URL=%s SHADOW=%s MAX_DEPLOY_PCT=%s KILL=%s",
+        settings.KIS_ENV.value, settings.URL_BASE, settings.SHADOW_MODE,
+        settings.MAX_DEPLOY_PCT, settings.kill_switch_on(),
+    )
 
     if args.init_db:
         init_db()
@@ -136,7 +148,8 @@ def main(argv: list[str] | None = None) -> int:
 
     # Scheduler
     sched = TradingScheduler(timezone="Asia/Seoul")
-    jobs = _make_job_handlers(settings, kis, notifier)
+    runtime = TradingRuntime(settings, kis, notifier)
+    jobs = _make_job_handlers(settings, kis, notifier, runtime)
     register_default_jobs(
         sched,
         master_refresh=jobs["master_refresh"],
@@ -163,7 +176,8 @@ def main(argv: list[str] | None = None) -> int:
     signal.signal(signal.SIGTERM, _signal_handler)
 
     sched.start()
-    notifier.send("[main] trading scheduler started")
+    mode = "SHADOW" if settings.SHADOW_MODE else "LIVE 실주문"
+    notifier.send(f"[main] trading scheduler started — {settings.KIS_ENV.value} / {mode}")
     try:
         while not stop_event.is_set():
             time.sleep(1.0)

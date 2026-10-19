@@ -131,3 +131,30 @@ def test_missing_in_kis(session):
     r = rec.verify()
     assert not r.ok
     assert r.diffs[0] == ("A", 0, 10)
+
+
+# --- managed_only: 수동 보유 종목이 있는 계좌 ---------------------------------
+
+def test_strict_mode_flags_external_holding(session):
+    rec = Reconciler(session, _kis_mock({"MANUAL": 5}))
+    assert not rec.verify().ok
+
+
+def test_managed_only_ignores_external_holding(session):
+    _pos(session, "A", "breakout", qty=10)
+    rec = Reconciler(session, _kis_mock({"A": 10, "MANUAL": 5}), managed_only=True)
+    r = rec.verify()
+    assert r.ok and "MANUAL" not in r.kis_holdings
+
+
+def test_managed_only_still_flags_managed_symbol_mismatch(session):
+    _pos(session, "A", "breakout", qty=10)
+    rec = Reconciler(session, _kis_mock({"A": 15}), managed_only=True)   # 수동 5주 섞임
+    assert not rec.verify().ok
+
+
+def test_managed_only_closed_position_still_managed(session):
+    """전량 청산(qty=0) 후 KIS 에 남아 있으면 불일치 — 매도 미체결 등."""
+    _pos(session, "A", "breakout", qty=0)
+    rec = Reconciler(session, _kis_mock({"A": 3}), managed_only=True)
+    assert not rec.verify().ok

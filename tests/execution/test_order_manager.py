@@ -430,3 +430,65 @@ def test_constants_match_rules():
     assert ENTRY_CUTOFF == time(15, 0)
     assert EOD_CANCEL == time(15, 15)
     assert MAX_RETRIES == 2
+
+
+# ---------------------------------------------------------------------------
+# 재시작 복원
+# ---------------------------------------------------------------------------
+
+def _restart(session, kis, clock):
+    om2 = OrderManager(kis_client=kis, portfolio=LivePortfolio(session),
+                       now_provider=lambda: clock[0])
+    lp = LivePortfolio(session)
+    n = om2.restore_open_orders(lp.open_trades(datetime(2000, 1, 1), datetime(2999, 1, 1)))
+    return om2, n
+
+
+def test_restore_tracks_fills_after_restart(session):
+    kis = FakeKis()
+    om, clock = _om(session, kis)
+    om.submit(_sig(), limit_price=70_000, qty=10, idempotency_key="k", buy_context=_ctx())
+    session.commit()
+    om2, n = _restart(session, kis, clock)
+    assert n == 1 and om2.pending["ORD1"].orgno == ""
+    kis.fill("ORD1", 10, 70_000)
+    om2.poll(current_prices={})
+    assert session.get(Position, ("005930", "news_swing")).qty == 10
+    assert session.query(Trade).one().status == "filled"
+
+
+def test_restored_buy_is_cancelled_not_resubmitted(session):
+    kis = FakeKis()
+    om, clock = _om(session, kis)
+    om.submit(_sig(), limit_price=70_000, qty=10, idempotency_key="k", buy_context=_ctx())
+    session.commit()
+    om2, _ = _restart(session, kis, clock)
+    clock[0] = _at(10, 4)
+    om2.poll(current_prices={"005930": 70_000})
+    assert kis.cancels == ["ORD1"] and len(kis.orders) == 1    # orgno 보충 후 취소
+    assert session.query(Trade).one().status == "cancelled_timeout"
+
+
+def test_restored_sell_keeps_repricing(session):
+    kis = FakeKis()
+    om, clock = _om(session, kis)
+    om.submit(_sig(Action.SELL, qty=10), limit_price=70_000, qty=10, idempotency_key="s")
+    session.commit()
+    om2, _ = _restart(session, kis, clock)
+    clock[0] = _at(10, 4)
+    om2.poll(current_prices={"005930": 70_000})
+    assert len(kis.orders) == 2 and kis.orders[1]["price"] < kis.orders[0]["price"]
+
+
+def test_restore_skips_closed_and_restores_unknown(session):
+    kis = FakeKis()
+    kis.order_errors.append(requests.Timeout("t/o"))
+    om, clock = _om(session, kis)
+    om.submit(_sig(), limit_price=70_000, qty=10, idempotency_key="u", buy_context=_ctx())
+    om.submit(_sig(symbol="000660"), limit_price=100_000, qty=1, idempotency_key="f",
+              buy_context=_ctx("000660"))
+    kis.fill("ORD1", 1, 100_000)
+    om.poll(current_prices={})
+    session.commit()
+    om2, n = _restart(session, kis, clock)
+    assert n == 1 and "unknown:u" in om2.pending

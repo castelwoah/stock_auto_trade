@@ -12,7 +12,7 @@ import requests
 
 from src.clients.rate_limiter import TokenBucket
 from src.config import Settings
-from src.common.clock import now_kst, today_kst
+from src.common.clock import now_kst
 
 
 logger = logging.getLogger(__name__)
@@ -60,6 +60,31 @@ class OrderFill:
     # 주문채번지점번호 — 주문 응답의 KRX_FWDG_ORD_ORGNO 와 같은 값으로 가정
     # (응답 유실 주문을 체결조회로 복구해 취소할 때 사용. 실전 스모크 테스트에서 확인)
     orgno: str = ""
+
+
+@dataclass(frozen=True)
+class Quote:
+    """inquire-price 1회로 얻는 시세 + 종목 상태 (리스크 게이트 입력)."""
+
+    symbol: str
+    price: float
+    market_cap: float          # 원 (hts_avls 억원 가정 × 1e8)
+    trade_value: float         # 당일 누적 거래대금 (원)
+    change_pct: float          # 전일 대비율 %
+    open_price: float
+    base_price: float          # 기준가 (≈ 전일 종가)
+    vi_active: bool
+    halted: bool
+    managed: bool              # 관리종목
+    market_warning: str        # 00 없음 / 01 투자주의 / 02 투자경고 / 03 투자위험 (가정)
+    caution: bool              # 투자유의
+    liquidation: bool          # 정리매매
+
+    @property
+    def gap_open_pct(self) -> float | None:
+        if self.open_price > 0 and self.base_price > 0:
+            return (self.open_price - self.base_price) / self.base_price * 100.0
+        return None
 
 
 @dataclass
@@ -111,7 +136,7 @@ class TokenStore:
 
     def move_expired(self) -> int:
         self.expired_dir.mkdir(parents=True, exist_ok=True)
-        today = today_kst()
+        today = now_kst().date()
         moved = 0
         for f in self.root.iterdir():
             if not f.is_file():
@@ -264,7 +289,7 @@ class KisClient:
             raise RuntimeError(f"current price fetch failed: {data.get('msg1')}")
         return int(data["output"]["stck_prpr"])
 
-    def get_quote(self, code: str) -> dict[str, float]:
+    def get_quote(self, code: str) -> Quote:
         """현재가 + 시가총액 (P0-5).
 
         hts_avls 단위는 억원으로 가정 → 원 환산 (공식 예제에 단위 미표기 — 실전
@@ -282,11 +307,32 @@ class KisClient:
         if data.get("rt_cd") != "0":
             raise RuntimeError(f"quote fetch failed: {data.get('msg1')}")
         out = data["output"]
-        return {
-            "price": float(out["stck_prpr"]),
-            "market_cap": float(out.get("hts_avls") or 0) * 100_000_000,
-            "trade_value": float(out.get("acml_tr_pbmn") or 0),
-        }
+        return Quote(
+            symbol=code,
+            price=float(out["stck_prpr"]),
+            market_cap=float(out.get("hts_avls") or 0) * 100_000_000,
+            trade_value=float(out.get("acml_tr_pbmn") or 0),
+            change_pct=_to_float(out.get("prdy_ctrt")),
+            open_price=_to_float(out.get("stck_oprc")),
+            base_price=_to_float(out.get("stck_sdpr")),
+            vi_active=str(out.get("vi_cls_code") or "N").strip() not in ("N", "0", ""),
+            halted=out.get("temp_stop_yn") == "Y",
+            managed=out.get("mang_issu_cls_code") == "Y",
+            market_warning=str(out.get("mrkt_warn_cls_code") or "00"),
+            caution=out.get("invt_caful_yn") == "Y",
+            liquidation=out.get("sltr_yn") == "Y",
+        )
+
+    def get_index_change_pct(self, index_code: str = "0001") -> float:
+        """업종지수 전일 대비율 % (0001 KOSPI / 1001 KOSDAQ). KOSPI −3% 게이트 입력."""
+        data = self._get(
+            "uapi/domestic-stock/v1/quotations/inquire-index-price",
+            tr_id="FHPUP02100000",
+            params={"FID_COND_MRKT_DIV_CODE": "U", "FID_INPUT_ISCD": index_code},
+        )
+        if data.get("rt_cd") != "0":
+            raise RuntimeError(f"index fetch failed: {data.get('msg1')}")
+        return float(data["output"]["bstp_nmix_prdy_ctrt"])
 
     def get_cash_balance(self, ref_code: str = "005930", ref_price: str = "65500") -> int:
         data = self._get(
@@ -370,7 +416,8 @@ class KisClient:
             "date": prev.get("stck_bsop_date"),
             "high": prev.get("stck_hgpr"),
             "low": prev.get("stck_lwpr"),
-            "open_today": rows[0].get("stck_oprc"),
+            # 장 시작 전엔 오늘 행이 없을 수 있다 → 오늘 행일 때만 시가 사용 (아니면 "0" → 전략이 건너뜀)
+            "open_today": rows[0].get("stck_oprc") if rows[0].get("stck_bsop_date") == today_str else "0",
             "avg_trade_value_20d": str(avg_value),
         }
 
@@ -479,6 +526,13 @@ class KisClient:
             nk = data.get("ctx_area_nk100", "")
             tr_cont = "N"
         return fills
+
+
+def _to_float(v: Any) -> float:
+    try:
+        return float(v or 0)
+    except (TypeError, ValueError):
+        return 0.0
 
 
 def _to_int(v: Any) -> int:

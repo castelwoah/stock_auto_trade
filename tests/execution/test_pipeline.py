@@ -272,7 +272,7 @@ def test_risk_blocked_reason_code_preserved(session):
 
 
 def test_capital_cap_clips_strategy_cash_and_buy_fits(session):
-    """상한 300,000 → 전략 현금이 300,000 으로 줄고(50% 배분 → 150,000), 매수가 상한 안에 들어감."""
+    """전략 신호 2,500,000(현금 500만 × 50%) → 상한 300,000 으로 축소되어 송신."""
 
     class _HalfCash(Strategy):
         strategy_id = "test_buy"
@@ -288,7 +288,7 @@ def test_capital_cap_clips_strategy_cash_and_buy_fits(session):
     pipe = _pipe(session, kis=kis, risk=_risk(capital_cap_krw=300_000), strategy=_HalfCash())
     executed = pipe.run_tick(_tick())
     assert len(executed) == 1
-    assert kis.order.call_args.kwargs["qty"] == 150      # 150,000 / 1,000
+    assert kis.order.call_args.kwargs["qty"] == 300      # 300,000 / 1,000
 
 
 def test_capital_cap_exhausted_blocks_buy(session):
@@ -297,3 +297,26 @@ def test_capital_cap_exhausted_blocks_buy(session):
     pipe = _pipe(session, kis=kis, risk=_risk(capital_cap_krw=300_000))
     assert pipe.run_tick(_tick()) == []
     assert kis.order.call_count == 0
+
+
+
+def test_pending_buy_counts_toward_cap(session):
+    """같은 날 미체결 매수가 있으면 다음 매수는 상한 잔여분만 사용."""
+
+    class _TwoBuys(Strategy):
+        strategy_id = "test_buy"
+
+        def decide_entries(self, ctx):
+            return [Signal(action=Action.BUY, symbol=s, strategy_id=self.strategy_id,
+                           notional=200_000, signal_id=f"s-{s}") for s in ("A", "B")]
+
+        def decide_exits(self, ctx):
+            return []
+
+    kis = _kis()
+    kis.order.side_effect = [OrderAck(odno="O1", orgno="1"), OrderAck(odno="O2", orgno="1")]
+    pipe = _pipe(session, kis=kis, risk=_risk(capital_cap_krw=300_000), strategy=_TwoBuys())
+    liq = {"A": LIQ["A"], "B": LIQ["A"]}
+    pipe.run_tick(_tick(current_prices={"A": 1000, "B": 1000}, liquidity=liq))
+    qtys = [c.kwargs["qty"] for c in kis.order.call_args_list]
+    assert qtys == [200, 100]                             # 200,000 + 100,000 = 상한

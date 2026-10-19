@@ -1,5 +1,6 @@
 """KisClient 주문·취소·체결조회·시세 — HTTP 는 monkeypatch 로 대체."""
 import json
+from datetime import datetime
 
 import pytest
 import requests
@@ -163,24 +164,64 @@ def test_get_quote_converts_market_cap(live_client, http):
     queue.append(FakeResponse({"rt_cd": "0", "output": {
         "stck_prpr": "70000", "hts_avls": "4000000", "acml_tr_pbmn": "123"}}))
     q = live_client.get_quote("005930")
-    assert q["price"] == 70000.0
-    assert q["market_cap"] == 4_000_000 * 100_000_000
+    assert q.price == 70000.0
+    assert q.market_cap == 4_000_000 * 100_000_000
+    assert not q.vi_active and not q.halted and q.market_warning == "00"
+    assert q.gap_open_pct is None
+
+
+def test_get_quote_status_flags(live_client, http):
+    _, queue = http
+    queue.append(FakeResponse({"rt_cd": "0", "output": {
+        "stck_prpr": "1050", "hts_avls": "600", "prdy_ctrt": "26.5", "stck_oprc": "1060",
+        "stck_sdpr": "1000", "vi_cls_code": "Y", "temp_stop_yn": "Y", "mang_issu_cls_code": "Y",
+        "mrkt_warn_cls_code": "02", "invt_caful_yn": "Y", "sltr_yn": "N"}}))
+    q = live_client.get_quote("123456")
+    assert q.change_pct == 26.5 and abs(q.gap_open_pct - 6.0) < 1e-9
+    assert q.vi_active and q.halted and q.managed and q.caution and not q.liquidation
+    assert q.market_warning == "02"
+
+
+def test_get_quote_error(live_client, http):
+    _, queue = http
+    queue.append(FakeResponse({"rt_cd": "1", "msg1": "x"}))
+    with pytest.raises(RuntimeError):
+        live_client.get_quote("005930")
 
 
 def test_prev_day_ohlc_avg_trade_value(live_client, http, monkeypatch):
     _, queue = http
-    rows = [{"stck_bsop_date": "29991231", "stck_oprc": "100"}]  # '오늘' 행 (제외)
+    rows = [{"stck_bsop_date": "20261020", "stck_oprc": "100"}]  # 오늘 행 (평균에서 제외)
     rows += [{"stck_bsop_date": f"2026100{i}", "stck_hgpr": "110", "stck_lwpr": "90",
               "stck_clpr": "100", "acml_vol": "1000"} for i in range(9, 0, -1)]
     queue.append(FakeResponse({"output": rows}))
-    monkeypatch.setattr(kis_mod, "datetime", _FixedDT)
+    monkeypatch.setattr(kis_mod, "now_kst", lambda: datetime(2026, 10, 20, 9, 5))
     out = live_client.get_prev_day_ohlc("005930")
     assert out["open_today"] == "100"
     assert out["date"] == "20261009"
     assert float(out["avg_trade_value_20d"]) == 100_000.0
 
 
-class _FixedDT(kis_mod.datetime):
-    @classmethod
-    def today(cls):
-        return cls(2026, 10, 20)
+def test_prev_day_ohlc_before_open_has_no_open_today(live_client, http, monkeypatch):
+    _, queue = http
+    rows = [{"stck_bsop_date": "20261016", "stck_oprc": "95", "stck_hgpr": "110",
+             "stck_lwpr": "90", "stck_clpr": "100", "acml_vol": "10"}]
+    queue.append(FakeResponse({"output": rows}))
+    monkeypatch.setattr(kis_mod, "now_kst", lambda: datetime(2026, 10, 19, 8, 59))
+    out = live_client.get_prev_day_ohlc("005930")
+    assert out["open_today"] == "0" and out["date"] == "20261016"
+
+
+def test_get_index_change_pct(live_client, http):
+    calls, queue = http
+    queue.append(FakeResponse({"rt_cd": "0", "output": {"bstp_nmix_prdy_ctrt": "-3.12"}}))
+    assert live_client.get_index_change_pct("0001") == -3.12
+    assert calls[0]["headers"]["tr_id"] == "FHPUP02100000"
+    assert calls[0]["params"]["FID_INPUT_ISCD"] == "0001"
+
+
+def test_get_index_change_pct_error(live_client, http):
+    _, queue = http
+    queue.append(FakeResponse({"rt_cd": "1", "msg1": "x"}))
+    with pytest.raises(RuntimeError):
+        live_client.get_index_change_pct()

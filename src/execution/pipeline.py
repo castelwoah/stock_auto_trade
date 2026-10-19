@@ -12,7 +12,7 @@ v4:
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import date, datetime
 from typing import Callable
 
@@ -119,7 +119,7 @@ class TradingPipeline:
         strat_ctx = StrategyContext(
             as_of=ctx.as_of,
             today=today,
-            cash_available=self._deployable_cash(ctx),
+            cash_available=ctx.cash_available,
             positions=positions_state,
             candidate_scores=ctx.candidate_scores,
             current_prices=ctx.current_prices,
@@ -130,7 +130,10 @@ class TradingPipeline:
         for sig in self.registry.all_signals(strat_ctx):
             if sig.action == Action.BUY and not entries_allowed:
                 continue
-            buy_ctx = self._build_buy_context(sig, ctx) if sig.action == Action.BUY else None
+            buy_ctx = None
+            if sig.action == Action.BUY:
+                buy_ctx = self._build_buy_context(sig, ctx)
+                sig, buy_ctx = self._clip_to_capital_cap(sig, buy_ctx)
             if not self._pass_risk(sig, ctx, buy_ctx):
                 continue
             if not self._execute(sig, ctx, today, buy_ctx):
@@ -138,17 +141,14 @@ class TradingPipeline:
             executed.append(sig)
         return executed
 
-    def _deployable_cash(self, ctx: TickContext) -> float:
-        """전략에 넘길 현금 = min(주문가능현금, 투입 상한 잔여). 전략이 상한 안에서 사이징하도록.
-        (상한 초과 자체는 RiskEngine.check_buy 의 capital_cap 게이트가 하드 차단)"""
-        held = {}
-        for pos in self.portfolio.iter_open_positions():
-            px = ctx.current_prices.get(pos.symbol, pos.avg_price)
-            held[pos.symbol] = held.get(pos.symbol, 0.0) + pos.qty * px
-        left = self.risk.capital_headroom(held)
-        if left is None:
-            return ctx.cash_available
-        return max(0.0, min(ctx.cash_available, left))
+    def _clip_to_capital_cap(self, sig: Signal, buy_ctx: BuyContext) -> tuple[Signal, BuyContext]:
+        """매수 금액을 투입 상한 잔여분으로 축소. 잔여 0 이면 그대로 두어
+        RiskEngine 의 capital_cap 게이트가 차단·기록하게 한다."""
+        left = self.risk.capital_headroom(buy_ctx.existing_positions_notional)
+        if left is None or left <= 0 or sig.notional <= left:
+            return sig, buy_ctx
+        logger.info("clip %s notional %.0f → %.0f (capital cap)", sig.symbol, sig.notional, left)
+        return replace(sig, notional=left), replace(buy_ctx, intended_notional=left)
 
     def _kill_switch_on(self) -> bool:
         if self.kill_switch is None:
@@ -199,6 +199,9 @@ class TradingPipeline:
         for pos in self.portfolio.iter_open_positions():
             p = ctx.current_prices.get(pos.symbol, pos.avg_price)
             existing[pos.symbol] = existing.get(pos.symbol, 0.0) + pos.qty * p
+        # 미체결 매수 주문도 투입액으로 본다 (상한·종목 20% 계산이 체결 전에 새지 않도록)
+        for sym, amount in self.orders.pending_buy_notional().items():
+            existing[sym] = existing.get(sym, 0.0) + amount
         portfolio_value = ctx.portfolio_value if ctx.portfolio_value is not None else self.portfolio.equity(ctx.cash_available, ctx.current_prices)
         market_cap, avg_value = ctx.liquidity.get(sig.symbol, (None, None))
         return BuyContext(

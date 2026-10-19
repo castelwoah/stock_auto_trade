@@ -149,6 +149,16 @@ class LivePortfolio:
             select(Trade).where(Trade.idempotency_key == idempotency_key)
         ).scalar_one_or_none()
 
+    def open_trades(self, day_start: datetime, day_end: datetime) -> list[Trade]:
+        """재시작 복원용: 해당 일자의 미종결 주문 (submitted / unknown)."""
+        return list(self.session.execute(
+            select(Trade).where(
+                Trade.ts >= day_start,
+                Trade.ts <= day_end,
+                Trade.status.in_(("submitted", "unknown")),
+            ).order_by(Trade.ts)
+        ).scalars().all())
+
     def executed_signal_ids(self, day_start: datetime, day_end: datetime) -> list[str]:
         """registry 복원용: 해당 일자에 실제 송신(또는 시도)된 signal_id. shadow 제외."""
         rows = self.session.execute(

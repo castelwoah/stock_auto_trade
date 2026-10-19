@@ -92,6 +92,9 @@ class Settings(BaseSettings):
     # 전략별 현금 배분 % (합 ≤ 100). news_swing 은 실데이터 검증 전까지 0
     ALLOC_BREAKOUT_PCT: float = Field(default=20.0, ge=0.0, le=100.0)
     ALLOC_NEWS_SWING_PCT: float = Field(default=0.0, ge=0.0, le=100.0)
+    # Reconciler 범위: False = 계좌 전체 비교(자동매매 전용 계좌 전제, 기본),
+    # True = 봇이 다룬 종목만 비교(수동 보유 종목이 있는 계좌)
+    RECONCILE_MANAGED_ONLY: bool = False
 
     def kill_switch_on(self) -> bool:
         return self.TRADING_DISABLED or self.KILL_SWITCH_FILE.exists()

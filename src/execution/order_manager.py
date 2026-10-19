@@ -271,12 +271,25 @@ class OrderManager:
             age = (now - po.submitted_at).total_seconds()
             if age < self.resubmit_after_seconds:
                 continue
-            if is_buy and (po.retries >= self.max_retries or now.time() >= ENTRY_CUTOFF):
+            if is_buy and (
+                po.retries >= self.max_retries
+                or now.time() >= ENTRY_CUTOFF
+                or po.buy_context is None   # 재시작 복원 주문 — gate 입력이 없으므로 재주문 안 함
+            ):
                 self._cancel_and_close(po, STATUS_CANCELLED_TIMEOUT)
                 continue
             ref = current_prices.get(po.signal.symbol, po.price)
             self._cancel_and_resubmit(po, ref_price=ref)
         self._prune()
+
+    def pending_buy_notional(self) -> dict[str, float]:
+        """활성 매수 주문의 미체결 잔량 × 지정가 (symbol 별). 체결분은 Position 으로 잡힌다."""
+        out: dict[str, float] = {}
+        for po in self.pending.values():
+            if po.active and po.signal.action == Action.BUY:
+                sym = po.signal.symbol
+                out[sym] = out.get(sym, 0.0) + po.remaining * po.price
+        return out
 
     def sync_fills(self) -> bool:
         """일별주문체결조회로 활성 주문의 체결 진행을 반영. 조회 실패 시 False."""
@@ -294,8 +307,37 @@ class OrderManager:
             if f is None and po.unknown:
                 f = self._adopt_unknown(po, fills)
             if f is not None:
+                if not po.orgno and f.orgno:
+                    po.orgno = f.orgno   # 재시작 복원 주문: 취소에 필요한 조직번호 보충
                 self._apply_progress(po, f)
         return True
+
+    def restore_open_orders(self, trades: list[Trade]) -> int:
+        """재시작 복원: 당일 submitted/unknown Trade 를 pending 으로 다시 추적.
+
+        orgno 는 다음 sync_fills 에서 체결조회 결과로 보충한다. 복원된 매수는
+        buy_context 가 없어 재주문하지 않고 타임아웃 시 취소만 한다.
+        """
+        n = 0
+        for t in trades:
+            if t.status not in (STATUS_SUBMITTED, STATUS_UNKNOWN):
+                continue
+            key = t.idempotency_key
+            sig = Signal(
+                action=Action(t.side), symbol=t.symbol, strategy_id=t.strategy_id,
+                qty=t.qty, signal_id=t.signal_id, reason="restored",
+            )
+            retries = int(key.rsplit("#r", 1)[1]) if "#r" in key else 0
+            oid = t.order_id or f"unknown:{key}"
+            po = PendingOrder(
+                order_id=oid, signal=sig, submitted_at=t.ts, price=t.price, qty=t.qty,
+                retries=retries, unknown=t.order_id is None, idempotency_key=key,
+            )
+            self.pending[oid] = po
+            if t.order_id:
+                self._tracked_odnos.add(t.order_id)
+            n += 1
+        return n
 
     def _adopt_unknown(self, po: PendingOrder, fills: list[OrderFill]) -> OrderFill | None:
         """응답 유실 주문을 체결조회에서 찾아 연결 (종목·방향·수량 일치, 미추적 주문번호)."""

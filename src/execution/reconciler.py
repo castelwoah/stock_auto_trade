@@ -55,9 +55,13 @@ class Reconciler:
         max_consecutive: int = MAX_CONSECUTIVE_MISMATCH,
         retry_grace_seconds: int = RETRY_GRACE_SECONDS,
         sleep_fn=time.sleep,
+        managed_only: bool = False,
     ) -> None:
         self.session = session
         self.kis = kis_client
+        # True: 봇이 한 번이라도 다룬 종목(Position 행 존재)만 비교 — 수동 보유 종목이
+        # 있는 계좌용. 같은 종목을 수동·봇이 함께 보유하면 여전히 불일치로 잡힌다(안전).
+        self.managed_only = managed_only
         self.max_consecutive = max_consecutive
         self.retry_grace_seconds = retry_grace_seconds
         self._sleep = sleep_fn
@@ -72,6 +76,12 @@ class Reconciler:
         """
         kis_holdings = self._read_kis_holdings()
         db_holdings = self._read_db_holdings()
+        if self.managed_only:
+            managed = self._managed_symbols()
+            external = sorted(set(kis_holdings) - managed)
+            if external:
+                logger.info("reconcile: ignoring external holdings %s", external)
+            kis_holdings = {s: q for s, q in kis_holdings.items() if s in managed}
         diffs: list[tuple[str, int, int]] = []
         all_symbols = set(kis_holdings) | set(db_holdings)
         for sym in sorted(all_symbols):
@@ -131,6 +141,10 @@ class Reconciler:
         for r in rows:
             out[r.symbol] = out.get(r.symbol, 0) + r.qty
         return out
+
+    def _managed_symbols(self) -> set[str]:
+        """Position 행이 있는(전량 청산돼 qty=0 인 것 포함) 종목 = 봇 관리 종목."""
+        return set(self.session.execute(select(Position.symbol)).scalars().all())
 
     @staticmethod
     def _format_diffs(diffs: list[tuple[str, int, int]]) -> str:
