@@ -60,3 +60,25 @@ def test_bucket_rate_explicit_override():
         token_store=_FakeTokenStore(),
     )
     assert c.bucket.refill_rate == 2.0 and c.bucket.capacity == 3
+
+
+def test_safety_defaults_are_conservative():
+    s = make_settings()
+    assert s.SHADOW_MODE is True
+    assert s.MAX_DEPLOY_PCT == 5.0
+    assert s.ALLOC_NEWS_SWING_PCT == 0.0 and s.ALLOC_BREAKOUT_PCT == 20.0
+
+
+@pytest.mark.parametrize("pct", [0.0, -1.0, 100.1])
+def test_max_deploy_pct_bounds(pct):
+    with pytest.raises(ValidationError):
+        make_settings(MAX_DEPLOY_PCT=pct)
+
+
+def test_kill_switch_flag_and_file(tmp_path):
+    flag = tmp_path / "TRADING_DISABLED"
+    s = make_settings(KILL_SWITCH_FILE=flag)
+    assert s.kill_switch_on() is False
+    flag.touch()
+    assert s.kill_switch_on() is True
+    assert make_settings(TRADING_DISABLED=True, KILL_SWITCH_FILE=tmp_path / "x").kill_switch_on()

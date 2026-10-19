@@ -118,7 +118,7 @@ class TradingPipeline:
         strat_ctx = StrategyContext(
             as_of=ctx.as_of,
             today=today,
-            cash_available=ctx.cash_available,
+            cash_available=self._deployable_cash(ctx),
             positions=positions_state,
             candidate_scores=ctx.candidate_scores,
             current_prices=ctx.current_prices,
@@ -136,6 +136,18 @@ class TradingPipeline:
                 continue
             executed.append(sig)
         return executed
+
+    def _deployable_cash(self, ctx: TickContext) -> float:
+        """전략에 넘길 현금 = min(주문가능현금, 투입 상한 잔여). 전략이 상한 안에서 사이징하도록.
+        (상한 초과 자체는 RiskEngine.check_buy 의 capital_cap 게이트가 하드 차단)"""
+        held = {}
+        for pos in self.portfolio.iter_open_positions():
+            px = ctx.current_prices.get(pos.symbol, pos.avg_price)
+            held[pos.symbol] = held.get(pos.symbol, 0.0) + pos.qty * px
+        left = self.risk.capital_headroom(held)
+        if left is None:
+            return ctx.cash_available
+        return max(0.0, min(ctx.cash_available, left))
 
     def _kill_switch_on(self) -> bool:
         if self.kill_switch is None:

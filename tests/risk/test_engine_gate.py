@@ -270,3 +270,47 @@ def test_risk_blocked_repr_and_str():
     assert err.code == "code1"
     assert "code1" in str(err) and "detail info" in str(err)
     assert "code1" in repr(err)
+
+
+# --- 실전 투입 상한 (capital_cap) -------------------------------------------
+
+def test_capital_cap_none_means_unlimited():
+    engine = _base_engine()
+    assert engine.capital_headroom({"A": 1e12}) is None
+    engine.check_buy(_ctx(intended_notional=1_000_000))
+
+
+def test_capital_cap_allows_within_limit():
+    engine = _base_engine(capital_cap_krw=500_000)
+    engine.check_buy(_ctx(existing_positions_notional={"000660": 100_000},
+                          intended_notional=400_000))
+
+
+def test_capital_cap_blocks_over_limit():
+    engine = _base_engine(capital_cap_krw=500_000)
+    with pytest.raises(RiskBlocked) as ei:
+        engine.check_buy(_ctx(existing_positions_notional={"000660": 100_000},
+                              intended_notional=400_001))
+    assert ei.value.code == "capital_cap"
+
+
+def test_capital_cap_blocks_when_exhausted_even_without_intent():
+    engine = _base_engine(capital_cap_krw=500_000)
+    with pytest.raises(RiskBlocked) as ei:
+        engine.check_buy(_ctx(existing_positions_notional={"000660": 500_000}))
+    assert ei.value.code == "capital_cap"
+
+
+def test_capital_cap_headroom_math():
+    engine = _base_engine(capital_cap_krw=500_000)
+    assert engine.capital_headroom({"A": 120_000, "B": 80_000}) == 300_000
+
+
+def test_capital_cap_negative_rejected():
+    with pytest.raises(ValueError):
+        _base_engine(capital_cap_krw=-1)
+
+
+def test_capital_cap_does_not_block_sell():
+    engine = _base_engine(capital_cap_krw=0)
+    engine.check_sell("005930")

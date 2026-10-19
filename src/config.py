@@ -81,6 +81,21 @@ class Settings(BaseSettings):
     DART_API_KEY: SecretStr | None = None
     ARCHIVE_ROOT: Path = Field(default_factory=lambda: PROJECT_ROOT / "reports")
 
+    # --- 실전 운용 안전장치 (Phase A, 2026-10) ---
+    # 투입 상한: 09:00 시작 평가액 대비 %. 전체 포지션 평가액 + 신규 매수 ≤ 상한
+    MAX_DEPLOY_PCT: float = Field(default=5.0, gt=0.0, le=100.0)
+    # 킬 스위치: True 이거나 파일이 존재하면 신규 매수 차단 (청산은 진행)
+    TRADING_DISABLED: bool = False
+    KILL_SWITCH_FILE: Path = Field(default_factory=lambda: PROJECT_ROOT / "run" / "TRADING_DISABLED")
+    # 섀도 모드: 전 파이프라인 + risk_gate 를 돌리되 KIS 주문 송신만 생략 (기본 ON — 해제는 명시적으로)
+    SHADOW_MODE: bool = True
+    # 전략별 현금 배분 % (합 ≤ 100). news_swing 은 실데이터 검증 전까지 0
+    ALLOC_BREAKOUT_PCT: float = Field(default=20.0, ge=0.0, le=100.0)
+    ALLOC_NEWS_SWING_PCT: float = Field(default=0.0, ge=0.0, le=100.0)
+
+    def kill_switch_on(self) -> bool:
+        return self.TRADING_DISABLED or self.KILL_SWITCH_FILE.exists()
+
     model_config = SettingsConfigDict(
         env_file=str(PROJECT_ROOT / ".env"),
         env_file_encoding="utf-8",

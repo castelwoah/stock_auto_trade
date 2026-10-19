@@ -206,7 +206,12 @@ class RiskEngine:
         liquidity_thresholds: LiquidityThresholds = LiquidityThresholds(),
         trades_history: Iterable[TradeRecord] = (),
         now_provider: Callable[[], datetime] = datetime.now,
+        capital_cap_krw: float | None = None,
     ) -> None:
+        if capital_cap_krw is not None and capital_cap_krw < 0:
+            raise ValueError("capital_cap_krw must be >= 0")
+        # 실전 투입 상한 (rules Phase 4): 전체 포지션 평가액 + 신규 매수 ≤ cap
+        self.capital_cap_krw = capital_cap_krw
         self.blacklist = blacklist
         self.market_state = market_state
         self.daily_loss = daily_loss
@@ -274,6 +279,21 @@ class RiskEngine:
                 "sizing",
                 f"요청 {ctx.intended_notional:,.0f} > 가능 {headroom:,.0f}",
             )
+
+        cap_left = self.capital_headroom(ctx.existing_positions_notional)
+        if cap_left is not None:
+            want = ctx.intended_notional or 0.0
+            if cap_left <= 0 or want > cap_left:
+                raise RiskBlocked(
+                    "capital_cap",
+                    f"투입 상한 {self.capital_cap_krw:,.0f} — 잔여 {max(cap_left, 0):,.0f}, 요청 {want:,.0f}",
+                )
+
+    def capital_headroom(self, existing_positions_notional: dict[str, float]) -> float | None:
+        """투입 상한까지 남은 금액. 상한 미설정이면 None."""
+        if self.capital_cap_krw is None:
+            return None
+        return self.capital_cap_krw - sum(existing_positions_notional.values())
 
     # ------------------------------------------------------------------
     # SELL
