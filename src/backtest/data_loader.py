@@ -108,7 +108,7 @@ class SyntheticDataLoader(BacktestDataLoader):
         # Use per-symbol RNG seeded deterministically so adding symbols does not
         # shift other symbols' price paths.
         for sym in self._symbols:
-            rng = random.Random((self._seed, sym, "bars"))
+            rng = random.Random(f"{self._seed}:{sym}:bars")
             bars: list[Bar] = []
             prev_close = self.START_PRICE
             for d in bdays:
@@ -138,7 +138,7 @@ class SyntheticDataLoader(BacktestDataLoader):
             self._bars_by_symbol[sym] = bars
 
         # News: deterministic per-day stream
-        news_rng = random.Random((self._seed, "news"))
+        news_rng = random.Random(f"{self._seed}:news")
         for d in bdays:
             for i in range(self._news_per_day):
                 sym = news_rng.choice(self._symbols)

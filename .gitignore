@@ -39,3 +39,7 @@ __pycache__/
 # OS
 .DS_Store
 Thumbs.db
+
+# 개발 환경 / Claude 로컬 설정
+.venv/
+.claude/settings.local.json

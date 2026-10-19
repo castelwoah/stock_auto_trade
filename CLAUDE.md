@@ -7,7 +7,7 @@
 
 ## Tech Stack
 
-- **Language**: Python 3.10 (dev) / **3.11+ 목표** (rules)
+- **Language**: Python 3.11 (`.venv`, uv 관리 — `scripts/setup-dev.sh`) / 시스템 python3 엔 pip 없음
 - **Dependencies**: `requirements.txt` — requests, PyYAML, pydantic, pydantic-settings, SQLAlchemy, **APScheduler** / dev: pytest, pytest-cov (pandas는 legacy만 사용)
 - **External API**: 한국투자증권 Open Trading API (`openapi.koreainvestment.com:9443`)
 - **Notification**: Discord Webhook
@@ -108,10 +108,21 @@ mini_project/
 │   └── cron.d/mini-trading           # 부가 작업 (DB 백업·로그 퍼지·헬스체크 옵션)
 ├── scripts/                # 운영 자동화 쉘 스크립트
 │   ├── install-systemd.sh  # sudo bash — 유닛 4개 cp + daemon-reload + enable --now (멱등)
+│   ├── setup-dev.sh        # uv 로 .venv(3.11) 생성 + requirements 설치 + pytest (멱등)
 │   ├── install-crontab.sh  # 사용자 crontab 에 mini-trading 블록 append (멱등)
 │   └── uninstall.sh        # 전체 제거
+├── .venv/                  # Python 3.11 개발 venv (git 제외, scripts/setup-dev.sh 로 재생성)
 └── .claude/
-    └── project-rules.md    # 자동매매 에이전트 시스템 프롬프트 v2.0 (차기 설계 방향성)
+    ├── project-rules.md    # 자동매매 에이전트 시스템 프롬프트 v2.0 (차기 설계 방향성)
+    ├── settings.json       # 하네스: 권한 allow/deny(민감 파일 Read 금지) + hooks 등록
+    ├── hooks/
+    │   ├── guard_secrets.py      # PreToolUse — config.yaml/.env/token.dat/KIS*/expired 접근·`git add -A` 차단
+    │   ├── protect_invariants.py # PreToolUse — 서브에이전트의 금지 영역(risk/registry/reconciler/order_manager/models) 편집 차단
+    │   └── run_layer_tests.py    # PostToolUse — 편집한 계층 tests/<layer> 자동 실행, 실패 시 모델에 반환
+    └── agents/
+        ├── test-runner.md        # pytest 실행·실패 요약 (haiku, 수정 금지)
+        ├── wiki-curator.md       # stock-wiki ingest/lint
+        └── module-implementer.md # 독립 모듈 구현 (금지 영역·불변식 브리핑 내장)
 ```
 
 ## Core Trading Logic (`stock_auto_trading.py`)
@@ -472,6 +483,12 @@ W8 (모의투자)   → 단일 세션 (관찰·튜닝)
       * `trading_tick` handler: TradingPipeline.run_tick() 호출
       * KIS 시장 지수(KOSPI/KOSDAQ) 조회 — 별도 TR_ID 필요
       * builder 에 portfolio/risk 주입 (RiskEngine ContextVar 구독)
+
+### 2026-10-19
+- **개발 하네스 구축**: 시스템 python3(3.14)에 pip/ensurepip 부재로 테스트 불가 상태였음 → uv 로 Python 3.11 `.venv` 구성 (`scripts/setup-dev.sh`, 멱등). `.claude/settings.json` + hooks 3종(민감 파일 가드 / 서브에이전트 금지 영역 가드 / 편집 계층 자동 테스트) + agents 3종(test-runner / wiki-curator / module-implementer) 추가.
+- **버그 수정 `src/backtest/data_loader.py`**: `random.Random((seed, sym, "bars"))` 튜플 시드가 Python 3.11+에서 TypeError (15 테스트 실패). 3.10에서도 `hash()` 기반이라 PYTHONHASHSEED 마다 값이 달라 seed 재현성이 실제로는 깨져 있었음 → 문자열 시드로 교체, 프로세스 간 동일성 확인. 전체 **477/477 pass**.
+- **LLM Wiki**: MCP `wiki`(user 스코프, `~/.local/lib/mcp-wiki/wrapper.mjs`) + Obsidian vault `stock-wiki`(`C:\Users\amoll\Documents\stock-wiki`) 기존 설치 확인. modules/decisions/concepts/ops 페이지 전면 작성.
+- **미해결**: `config.yaml` 없음 → `--dry-run` 이 필수 키 검증에서 abort (설계대로). `ops/`·docs 경로가 `/home/mycom/...` 하드코딩.
 
 ## Notes
 

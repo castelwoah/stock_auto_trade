@@ -1,0 +1,53 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-settings.json",
+  "permissions": {
+    "allow": [
+      "Bash(.venv/bin/python -m pytest:*)",
+      "Bash(.venv/bin/python -m src.main --dry-run)",
+      "Bash(git status:*)",
+      "Bash(git diff:*)",
+      "Bash(git log:*)",
+      "Bash(git show:*)",
+      "mcp__wiki__read_text_file",
+      "mcp__wiki__read_multiple_files",
+      "mcp__wiki__list_directory",
+      "mcp__wiki__directory_tree",
+      "mcp__wiki__search_files",
+      "mcp__wiki__get_file_info"
+    ],
+    "deny": [
+      "Read(./config.yaml)",
+      "Read(./.env)",
+      "Read(./.env.*)",
+      "Read(./token.dat)",
+      "Read(./KIS2*)",
+      "Read(./expired/**)",
+      "Bash(git push --force:*)",
+      "Bash(sudo:*)"
+    ]
+  },
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Read|Edit|Write|NotebookEdit|Bash",
+        "hooks": [
+          { "type": "command", "command": "python3 \"$CLAUDE_PROJECT_DIR/.claude/hooks/guard_secrets.py\"" }
+        ]
+      },
+      {
+        "matcher": "Edit|Write",
+        "hooks": [
+          { "type": "command", "command": "python3 \"$CLAUDE_PROJECT_DIR/.claude/hooks/protect_invariants.py\"" }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write",
+        "hooks": [
+          { "type": "command", "command": "python3 \"$CLAUDE_PROJECT_DIR/.claude/hooks/run_layer_tests.py\"", "timeout": 200 }
+        ]
+      }
+    ]
+  }
+}
