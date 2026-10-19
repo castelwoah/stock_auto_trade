@@ -76,14 +76,17 @@ mini_project/
 │   │   └── metrics.py       # Sharpe(252) / MDD / Win rate / PF(999 sentinel) / CAGR / Alpha + snapshot fixture
 │   ├── execution/          # W8 신설 (reconciler · order_manager 는 서브에이전트 금지 영역)
 │   │   ├── portfolio.py     # LivePortfolio (DB Position ↔ StrategyContext, Trade 멱등 INSERT, highest_price D3 영속)
-│   │   ├── reconciler.py    # KIS × DB 교차검증, 3회 연속 불일치 → trading_off + RiskEvent 기록 (D6)
-│   │   ├── order_manager.py # 지정가 IOC, 3분 타임아웃 → 1호가 상향 재시도, 15:00 cut-off / 15:15 일괄 취소
-│   │   └── pipeline.py      # tick 체인: Registry → Risk → Order (trading_off 하드게이트)
+│   │   ├── reconciler.py    # KIS × DB 교차검증, 3회 연속 불일치 → trading_off + RiskEvent 기록 (D6), managed_only 옵션
+│   │   ├── order_manager.py # v4: 송신 게이트(D8) · 체결조회 동기화 · 취소 확인 후 잔량 재주문 · @risk_gate · shadow · 재시작 복원
+│   │   ├── krx_tick.py      # KRX 호가단위 정렬 / n호가 이동
+│   │   └── pipeline.py      # tick 체인: Registry → Risk → Order (trading_off·kill switch·투입 상한·고점 갱신)
 │   ├── scheduler/          # W8 신설
 │   │   ├── calendar.py      # KRX 2026 휴장일 (Agent), is_business_day / next·prev / business_days_between
 │   │   ├── watchlist.py     # 30종목 초기 watchlist (legacy 12 + KOSPI 10 + KOSDAQ 8, 블랙리스트 제외)
 │   │   └── app.py           # APScheduler wrapper — 영업일 게이트 / misfire 300s / cron + interval 헬퍼
-│   ├── main.py             # W8 엔트리포인트 — config→clients→scheduler wire-up, SIGINT/SIGTERM graceful shutdown
+│   ├── main.py             # W8 엔트리포인트 — config→clients→runtime→scheduler wire-up, SIGINT/SIGTERM graceful shutdown
+│   ├── runtime.py          # Phase A: TradingRuntime — 09:00 prepare / 5분 tick 본체 (시세·종목상태·지수 → pipeline)
+│   ├── common/clock.py     # now_kst / today_kst — 시각 단일 기준 KST
 │   └── persistence/        # W2 신설
 │       ├── db.py           # SQLAlchemy engine/session, session_scope, init_db
 │       └── models.py       # 8 tables: NewsArticle, ArticleSymbol, StockScore, Trade(idem UNIQUE), Position(symbol+strategy_id PK), RiskEvent, DailyPnl, CashFlow
@@ -95,7 +98,12 @@ mini_project/
 │   ├── reporting/          # 40개 테스트 (daily 14 + intraday 11 + archiver 15) — 커버리지 97%
 │   ├── backtest/           # 51개 테스트 (portfolio 18 + metrics 11 + data_loader 13 + engine integration 9) — 커버리지 94%
 │   │   └── fixtures/metrics_snapshot.json  # W7 회귀 검증 기준
-│   ├── execution/          # 35개 테스트 (portfolio 10 + reconciler 10 + order_manager 10 + pipeline 5) — 커버리지 93%
+│   ├── execution/          # 커버리지 96~100% (order_manager v4 · pipeline · portfolio · reconciler · krx_tick)
+│   ├── clients/            # KIS 주문·취소·체결조회·시세·토큰 + KisEnv 프로파일 — 커버리지 98%
+│   ├── common/             # KST 기준 (호스트 TZ=UTC 에서도)
+│   ├── test_runtime.py     # 하루 흐름 통합 (prepare → tick, shadow/live, reconcile, 종목상태 게이트, 재시작)
+│   ├── test_main.py        # 엔트리 배선 · 핸들러 예외 격리
+│   ├── test_ops_templates.py  # ops 템플릿 하드코딩 재유입 방지
 │   └── scheduler/          # 37개 테스트 (calendar 19 + watchlist 8 + app 4 + data loader 등) — 커버리지 88%
 ├── docs/                   # W8+ 신설
 │   ├── runbook.md          # 장애 플레이북 7 시나리오 (토큰/네트워크/Reconciler/CB/Daily Loss/주문/비정상종료)
@@ -107,7 +115,8 @@ mini_project/
 │   ├── mini-trading-stop.service     # oneshot stop
 │   └── cron.d/mini-trading           # 부가 작업 (DB 백업·로그 퍼지·헬스체크 옵션)
 ├── scripts/                # 운영 자동화 쉘 스크립트
-│   ├── install-systemd.sh  # sudo bash — 유닛 4개 cp + daemon-reload + enable --now (멱등)
+│   ├── _ops_common.sh      # ops 템플릿(@PROJECT_ROOT@/@RUN_USER@/@RUN_GROUP@/@PYTHON@) 렌더 공통
+│   ├── install-systemd.sh  # sudo bash — 유닛 4개 렌더 + verify + daemon-reload + enable --now (멱등)
 │   ├── setup-dev.sh        # uv 로 .venv(3.11) 생성 + requirements 설치 + pytest (멱등)
 │   ├── install-crontab.sh  # 사용자 crontab 에 mini-trading 블록 append (멱등)
 │   └── uninstall.sh        # 전체 제거
@@ -488,7 +497,17 @@ W8 (모의투자)   → 단일 세션 (관찰·튜닝)
 - **개발 하네스 구축**: 시스템 python3(3.14)에 pip/ensurepip 부재로 테스트 불가 상태였음 → uv 로 Python 3.11 `.venv` 구성 (`scripts/setup-dev.sh`, 멱등). `.claude/settings.json` + hooks 3종(민감 파일 가드 / 서브에이전트 금지 영역 가드 / 편집 계층 자동 테스트) + agents 3종(test-runner / wiki-curator / module-implementer) 추가.
 - **버그 수정 `src/backtest/data_loader.py`**: `random.Random((seed, sym, "bars"))` 튜플 시드가 Python 3.11+에서 TypeError (15 테스트 실패). 3.10에서도 `hash()` 기반이라 PYTHONHASHSEED 마다 값이 달라 seed 재현성이 실제로는 깨져 있었음 → 문자열 시드로 교체, 프로세스 간 동일성 확인. 전체 **477/477 pass**.
 - **LLM Wiki**: MCP `wiki`(user 스코프, `~/.local/lib/mcp-wiki/wrapper.mjs`) + Obsidian vault `stock-wiki`(`C:\Users\amoll\Documents\stock-wiki`) 기존 설치 확인. modules/decisions/concepts/ops 페이지 전면 작성.
-- **미해결**: `config.yaml` 없음 → `--dry-run` 이 필수 키 검증에서 abort (설계대로). `ops/`·docs 경로가 `/home/mycom/...` 하드코딩.
+- **결정 (사용자)**: ① 시각 KST 통일 ② 손절 매도는 취소 없이 하향 재주문 ③ ~~PAPER dry-run~~ → **모의투자 생략, 실전 직행** (rules §13 Phase 3 게이트 미충족 — 사용자 결정으로 생략, 대신 섀도 모드 3영업일 + 투입 상한 5% + 킬 스위치) ④ 구 `.coverage`(W8 시점, /home/mycom 경로) 삭제 ⑤ news_swing 보유 기본 3영업일·조건부 5일 (Phase C).
+- **Phase A 완료 (브랜치 `feat/live-readiness-phase-a`, push 안 함)** — 실전 주문 경로 안전화:
+    - **KIS**: `rt_cd` 검사(거절 예외), 필수 `EXCG_ID_DVSN_CD=KRX`, `ODNO`+`KRX_FWDG_ORD_ORGNO` 보관, 지정가 외 거부, 취소(`TTTC0013U`)·체결조회(`TTTC0081R`, 연속조회)·지수(`FHPUP02100000`)·종목상태(관리·경고·VI·정지) 조회. TR_ID 는 공식 `koreainvestment/open-trading-api` 예제로 확정. `KisEnv` 프로파일(URL·TR·초당 한도 LIVE 18 / PAPER 4) + URL 불일치 시 기동 abort.
+    - **OrderManager v4**: 신규 idempotency_key 일 때만 송신(재시작 중복 차단), 매 poll 체결조회로 부분 체결까지 반영, **취소 성공 확인 후에만 잔량 재주문**, KRX 호가단위, 매수 +1호가 2회 / 매도 −1호가 무제한, 매도 첫가 −1%, 거절·차단 매도 재시도 5회, 네트워크 예외만 `unknown`(체결조회로 복구), 재시작 시 미종결 주문 복원. 모든 송신 `@risk_gate` 경유(D14 실제 적용).
+    - **Risk/Pipeline**: 투입 상한 `capital_cap`(09:00 평가액 × `MAX_DEPLOY_PCT`, 미체결 매수 포함, 배분 후 금액 축소), 킬 스위치(`TRADING_DISABLED` / `run/TRADING_DISABLED` 파일 — 매수만 차단), tick 마다 `set_risk_engine`(스케줄러 스레드), 고점 갱신 + `tp_armed` 를 영속 고점에서 유도(D3, 스키마 무변경), 유동성 하드코딩 제거(실데이터·fail-closed, 백테스트는 `assume_liquid` 명시).
+    - **Runtime/main**: `prepare_state`·`trading_tick` 실구현(`src/runtime.py`). 동적 블랙리스트·MarketState(등락률·갭·VI·정지)·KOSPI/KOSDAQ 지수 매 tick 반영. 기본 `SHADOW_MODE=True`, 배분 breakout 20% / news_swing 0%.
+    - **KST 통일**: `src/common/clock.py`, ORM default 만 변경(DDL 무변경), 영업일 게이트·토큰·리포트 전부 KST.
+    - **ops**: systemd/cron 템플릿화(`@PROJECT_ROOT@` 등) + `scripts/_ops_common.sh` 렌더 + `systemd-analyze verify` 통과. runbook 에 실전 운용 스위치 표.
+    - **테스트**: 477 → **652 pass**, 전체 커버리지 91% (kis 98% / execution 96~100% / runtime 96% / risk 100%).
+- **확인 필요 (실전 스모크 테스트)**: `hts_avls` 단위(억원 가정), `vi_cls_code` 값 체계, `mrkt_warn_cls_code` 01/02/03 의미, 체결조회 `ord_gno_brno` = 주문 응답 `KRX_FWDG_ORD_ORGNO` 가정, 실전 초당 한도.
+- **알려진 제약**: 섀도 모드의 매수는 미체결 추적을 하지 않아 상한 계산이 실전보다 느슨함. 하한가 근처 매도는 가격제한폭 거절 가능(재시도 5회 후 수동 대응). Circuit Breaker 의 연속 손실일 입력(`DailyPnl` 기록)은 Phase B.
 
 ## Notes
 
