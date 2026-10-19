@@ -63,6 +63,10 @@ def business_days(start: date, end: date) -> list[date]:
 
 # --- config + result --------------------------------------------------------
 
+# assume_liquid=True 일 때 쓰는 값: 임계치(500억 / 10억)의 10배 — "충분히 유동적" 가정을 명시
+_ASSUMED_LIQUID = (500_000_000_000, 10_000_000_000)
+
+
 @dataclass(frozen=True)
 class BacktestConfig:
     start_date: date
@@ -70,6 +74,10 @@ class BacktestConfig:
     symbols: list[str]
     initial_cash: float = 10_000_000.0
     bar_interval_min: int = DEFAULT_BAR_INTERVAL_MIN
+    # symbol → (시가총액, 20일 평균 거래대금). 없는 종목은 유동성 게이트에서 차단(실전과 동일).
+    liquidity: dict[str, tuple[float, float]] = field(default_factory=dict)
+    # 합성 데이터 등 유동성 정보가 없는 백테스트에서 "유동성 충분" 을 명시적으로 가정
+    assume_liquid: bool = False
 
 
 @dataclass(frozen=True)
@@ -201,13 +209,19 @@ class BacktestEngine:
         for (sym, _sid), pos in self.sim.positions.items():
             p = prices.get(sym, pos.avg_price)
             existing[sym] = existing.get(sym, 0.0) + pos.qty * p
+        liq = self.config.liquidity.get(sig.symbol)
+        if liq is not None:
+            market_cap, avg_value = int(liq[0]), int(liq[1])
+        elif self.config.assume_liquid:
+            market_cap, avg_value = _ASSUMED_LIQUID
+        else:
+            market_cap = avg_value = None   # fail-closed (실전 pipeline 과 동일)
         return BuyContext(
             symbol=sig.symbol,
             portfolio_value=portfolio_value,
             existing_positions_notional=existing,
-            # 유동성·시총은 backtest 에선 생략 (실 데이터에서 주입) → 기본 충족 시총/거래대금
-            market_cap=50_000_000_000,  # 최저 임계와 동일 (통과 허용)
-            avg_volume_krw=1_000_000_000,
+            market_cap=market_cap,
+            avg_volume_krw=avg_value,
             intended_notional=sig.notional if sig.notional > 0 else None,
         )
 

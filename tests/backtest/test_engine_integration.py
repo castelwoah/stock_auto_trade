@@ -103,6 +103,7 @@ def _build_engine(symbols, start, end, *, initial_cash=1_000_000) -> BacktestEng
     config = BacktestConfig(
         start_date=start, end_date=end, symbols=symbols,
         initial_cash=initial_cash, bar_interval_min=30,  # 속도 위해 30분 간격
+        assume_liquid=True,   # 합성 데이터 — 유동성 정보 없음
     )
     return BacktestEngine(
         config=config, loader=loader, registry=reg, sim=sim,
@@ -178,6 +179,7 @@ def test_engine_risk_blocked_appears_in_skips():
     config = BacktestConfig(
         start_date=date(2026, 4, 20), end_date=date(2026, 4, 20),
         symbols=["AAA"], initial_cash=1_000_000, bar_interval_min=30,
+        assume_liquid=True,
     )
 
     def _bl_engine(start_equity):
@@ -198,3 +200,24 @@ def test_engine_risk_blocked_appears_in_skips():
     result = eng.run()
     assert len(result.fills) == 0  # 블랙리스트 차단
     assert any("risk:blacklist" in s.reason for s in result.skips)
+
+
+
+def test_engine_without_liquidity_data_blocks_buys():
+    """유동성 정보가 없고 assume_liquid 도 아니면 매수는 risk:liquidity 로 스킵 (실전과 동일)."""
+    from dataclasses import replace
+
+    eng = _build_engine(["AAA"], date(2026, 4, 20), date(2026, 4, 24))
+    eng.config = replace(eng.config, assume_liquid=False)
+    result = eng.run()
+    assert not any(f.side == "BUY" for f in result.fills)
+    assert any(s.reason == "risk:liquidity" for s in result.skips)
+
+
+def test_engine_uses_provided_liquidity():
+    from dataclasses import replace
+
+    eng = _build_engine(["AAA"], date(2026, 4, 20), date(2026, 4, 24))
+    eng.config = replace(eng.config, assume_liquid=False, liquidity={"AAA": (1e12, 1e11)})
+    result = eng.run()
+    assert not any(s.reason == "risk:liquidity" for s in result.skips)
