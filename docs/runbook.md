@@ -28,6 +28,27 @@
 
 긴급 매수 중단: `touch $PROJECT_ROOT/run/TRADING_DISABLED` → 해제: `rm $PROJECT_ROOT/run/TRADING_DISABLED`
 
+#### 1.2 실전 스모크 테스트 (`scripts/smoke_live.py`)
+
+섀도 모드 기간 중 1회, 장중(영업일 09:00~15:20)에 실행. 결과는 화면 + `logs/smoke-*.json` (계좌번호·키 미기록).
+
+```bash
+.venv/bin/python scripts/smoke_live.py                       # 1) 읽기 전용 — 시세·종목상태·지수·잔고
+.venv/bin/python scripts/smoke_live.py --order               # 2) 삼성전자 1주 현재가 −10% 지정가 매수 → 즉시 취소
+.venv/bin/python scripts/smoke_live.py --status-symbols 코드1,코드2   # 투자경고·VI 발동 종목 상태 원값 확인
+.venv/bin/python scripts/smoke_live.py --rate-test           # 초당 한도 (데몬 tick 시각 :x0·:x5 분은 피할 것)
+```
+
+| ID | 확인 | FAIL 시 |
+|---|---|---|
+| R1 | `hts_avls` 단위가 억원 | `get_quote` 환산 계수 수정 전까지 유동성 게이트 신뢰 불가 |
+| R2 | 종목상태 원값 (`vi_cls_code`·`mrkt_warn_cls_code` 등) | 발동 종목 원값으로 `get_quote` 판정식 확인 |
+| O2 | 체결조회 `ord_gno_brno` = 주문 응답 `KRX_FWDG_ORD_ORGNO` | 응답 유실 주문의 자동 취소 불가 — 수정 전 실주문 보류 |
+| O3 | 취소 후 원주문 행 `rmn_qty`·`cncl_yn` | 수동취소 감지 가정(`cncl_yn=='Y'`) 재검토 |
+
+- `--order` 는 `SHADOW_MODE: true` 일 때만 동작한다 (데몬 실주문과 겹침 방지). OrderManager·DB 를 거치지 않는다.
+- 취소 실패(`O3 FAIL 취소 실패`) 또는 체결(`체결됨`)이 나오면 HTS/MTS 에서 해당 주문을 직접 취소·매도한다.
+
 ---
 
 ### 2. 정상 가동 상태 체크리스트

@@ -119,6 +119,7 @@ mini_project/
 │   ├── install-systemd.sh  # sudo bash — 유닛 4개 렌더 + verify + daemon-reload + enable --now (멱등)
 │   ├── setup-dev.sh        # uv 로 .venv(3.11) 생성 + requirements 설치 + pytest (멱등)
 │   ├── install-crontab.sh  # 사용자 crontab 에 mini-trading 블록 append (멱등)
+│   ├── smoke_live.py       # 실전 스모크: 시세·상태·지수·잔고 원값 + (--order) 1주 매수→취소 → logs/smoke-*.json
 │   └── uninstall.sh        # 전체 제거
 ├── .venv/                  # Python 3.11 개발 venv (git 제외, scripts/setup-dev.sh 로 재생성)
 └── .claude/
@@ -506,6 +507,7 @@ W8 (모의투자)   → 단일 세션 (관찰·튜닝)
     - **KST 통일**: `src/common/clock.py`, ORM default 만 변경(DDL 무변경), 영업일 게이트·토큰·리포트 전부 KST.
     - **ops**: systemd/cron 템플릿화(`@PROJECT_ROOT@` 등) + `scripts/_ops_common.sh` 렌더 + `systemd-analyze verify` 통과. runbook 에 실전 운용 스위치 표.
     - **테스트**: 477 → **652 pass**, 전체 커버리지 91% (kis 98% / execution 96~100% / runtime 96% / risk 100%).
+- **스모크 테스트 스크립트** `scripts/smoke_live.py` (runbook §1.2) — 아래 가정값을 R1·R2·O2·O3 로 판정. 원주문 행 `cncl_yn`(수동취소 감지 근거)도 함께 확인.
 - **확인 필요 (실전 스모크 테스트)**: `hts_avls` 단위(억원 가정), `vi_cls_code` 값 체계, `mrkt_warn_cls_code` 01/02/03 의미, 체결조회 `ord_gno_brno` = 주문 응답 `KRX_FWDG_ORD_ORGNO` 가정, 실전 초당 한도.
 - **알려진 제약**: 섀도 모드의 매수는 미체결 추적을 하지 않아 상한 계산이 실전보다 느슨함. 하한가 근처 매도는 가격제한폭 거절 가능(재시도 5회 후 수동 대응). Circuit Breaker 의 연속 손실일 입력(`DailyPnl` 기록)은 Phase B.
 
