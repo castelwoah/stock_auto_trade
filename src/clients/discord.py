@@ -6,6 +6,7 @@ from typing import Any
 
 import requests
 from src.common.clock import now_kst
+from src.common.redact import redact
 
 
 logger = logging.getLogger(__name__)
@@ -19,7 +20,7 @@ class DiscordNotifier:
         self.timeout = timeout
 
     def send(self, msg: str, *, include_timestamp: bool = True) -> bool:
-        content = self._format(msg, include_timestamp)
+        content = redact(self._format(msg, include_timestamp))
         try:
             res = requests.post(
                 self.webhook_url,
@@ -29,7 +30,7 @@ class DiscordNotifier:
             res.raise_for_status()
             return True
         except requests.RequestException as e:
-            logger.warning("Discord send failed: %s", e)
+            logger.warning("Discord send failed: %s", type(e).__name__)
             return False
 
     def send_embed(self, embed: dict[str, Any]) -> bool:
@@ -42,7 +43,7 @@ class DiscordNotifier:
             res.raise_for_status()
             return True
         except requests.RequestException as e:
-            logger.warning("Discord embed send failed: %s", e)
+            logger.warning("Discord embed send failed: %s", type(e).__name__)
             return False
 
     @staticmethod

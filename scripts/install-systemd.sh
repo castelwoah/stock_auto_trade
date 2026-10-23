@@ -28,8 +28,10 @@ fi
 echo "  PROJECT_ROOT=$PROJECT_ROOT  RUN_USER=$RUN_USER:$RUN_GROUP  PYTHON=$PYTHON"
 
 echo "[1/5] logs · run 디렉터리 확인 (run/ 은 킬 스위치 파일 위치)"
-mkdir -p "$PROJECT_ROOT/logs" "$PROJECT_ROOT/run"
-chown -R "$RUN_USER:$RUN_GROUP" "$PROJECT_ROOT/logs" "$PROJECT_ROOT/run"
+mkdir -p "$PROJECT_ROOT/logs" "$PROJECT_ROOT/run" "$PROJECT_ROOT/data"
+# systemd 의 StandardOutput=append: 는 파일이 없으면 root 소유로 만든다 → 미리 생성
+touch "$PROJECT_ROOT/logs/main.log" "$PROJECT_ROOT/logs/main.err"
+chown -R "$RUN_USER:$RUN_GROUP" "$PROJECT_ROOT/logs" "$PROJECT_ROOT/run" "$PROJECT_ROOT/data"
 
 echo "[2/5] systemd 유닛 렌더링 → $TARGET"
 for u in "${UNITS[@]}"; do

@@ -21,6 +21,7 @@ from sqlalchemy.orm import Session
 from src.clients.discord import DiscordNotifier
 from src.clients.kis import KisClient, Quote
 from src.common.clock import now_kst
+from src.common.redact import redact
 from src.config import Settings
 from src.execution.order_manager import OrderManager
 from src.execution.pipeline import TickContext, TradingPipeline
@@ -105,6 +106,9 @@ class TradingRuntime:
         self.prev_day_ohlc: dict[str, dict[str, float]] = {}
         self.avg_trade_value: dict[str, float] = {}
         self._last_error_notice: datetime | None = None
+        # 잔고 조회 실패 시 대체값 (해당 tick 은 매수 차단) — P1
+        self._last_cash: float | None = None
+        self._last_equity: float | None = None
 
     # ------------------------------------------------------------------
     # 09:00
@@ -123,6 +127,7 @@ class TradingRuntime:
         recon = reconciler.verify_with_grace()
 
         start_equity = self._read_equity()
+        self._last_equity = start_equity
         cap = start_equity * self.settings.MAX_DEPLOY_PCT / 100.0
         risk = RiskEngine(
             blacklist=StaticBlacklist(),
@@ -192,12 +197,14 @@ class TradingRuntime:
         quotes = self._fetch_quotes(sorted(set(self.symbols) | held))
         self._apply_market_state(quotes)
 
+        cash, equity, stale = self._read_account()
         ctx = TickContext(
             as_of=now,
-            cash_available=float(self.kis.get_cash_balance()),
+            cash_available=cash,
             current_prices={s: q.price for s, q in quotes.items()},
             prev_day_ohlc=self.prev_day_ohlc,
-            portfolio_value=self._read_equity(),
+            portfolio_value=equity,
+            block_entries_reason=stale,
             liquidity={
                 s: (q.market_cap or None, self.avg_trade_value.get(s) or None)
                 for s, q in quotes.items()
@@ -229,11 +236,32 @@ class TradingRuntime:
         if self._last_error_notice and now - self._last_error_notice < ERROR_NOTICE_INTERVAL:
             return
         self._last_error_notice = now
-        self.notifier.send(f"[{where}] 오류: {type(exc).__name__}: {exc} ({now:%H:%M})")
+        self.notifier.send(redact(f"[{where}] 오류: {type(exc).__name__}: {exc} ({now:%H:%M})"))
 
     # ------------------------------------------------------------------
     # data
     # ------------------------------------------------------------------
+    def _read_account(self) -> tuple[float, float, str | None]:
+        """(현금, 평가액, 직전값 사용 사유). 조회 실패 시 직전 성공값으로 대체하고
+        사유를 돌려준다 → 해당 tick 은 매수만 막고 청산은 진행. 직전값도 없으면 예외."""
+        stale: list[str] = []
+        try:
+            self._last_cash = float(self.kis.get_cash_balance())
+        except Exception as exc:
+            if self._last_cash is None:
+                raise
+            logger.warning("cash balance failed — using last value: %s", redact(exc))
+            stale.append("현금")
+        try:
+            self._last_equity = self._read_equity()
+        except Exception as exc:
+            if self._last_equity is None:
+                raise
+            logger.warning("equity read failed — using last value: %s", redact(exc))
+            stale.append("평가액")
+        reason = f"잔고 조회 실패({'·'.join(stale)}) — 직전값 사용" if stale else None
+        return self._last_cash, self._last_equity, reason
+
     def _read_equity(self) -> float:
         _, evaluation = self.kis.get_stock_balance()
         try:

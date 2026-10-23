@@ -245,11 +245,8 @@ def test_restart_same_day_does_not_resend(factory, tmp_path):
     rt.tick()
     assert len(kis.orders) == 1
     rt.close()
-    # 프로세스 재시작 — Trade.ts 는 실제 now_kst 로 기록되므로 같은 날로 맞춘다
-    from src.common.clock import now_kst
-
-    today = now_kst()
-    clock2 = [today.replace(hour=9, minute=30)]
+    # 프로세스 재시작 (같은 날) — Trade.ts 는 주입 시계로 기록된다
+    clock2 = [datetime(2026, 10, 20, 9, 30)]
     rt2, _ = _rt(factory, kis, clock=clock2, tmp_path=tmp_path, SHADOW_MODE=False)
     rt2.prepare()
     assert "복원 주문 1건" in rt2.notifier.sent[-1]
@@ -332,3 +329,44 @@ def test_quote_helpers():
     assert quote_blacklist_entry(_quote(halted=True)) is not None
     ms = build_market_state({SYM: _quote(halted=True, vi_active=True)})
     assert SYM in ms.halted and SYM in ms.vi_active
+
+
+# --- P1: 잔고 조회 실패 시 직전값 + 매수만 차단 -------------------------------------
+
+def test_balance_failure_uses_last_value_and_blocks_entries(factory, tmp_path):
+    kis = FakeKis()
+    rt, clock = _rt(factory, kis, tmp_path=tmp_path)
+    rt.prepare()
+    clock[0] = datetime(2026, 10, 20, 9, 5)
+    kis.quotes = {}                    # 첫 tick: 신호 없이 직전값만 확보
+    rt.tick()
+    kis.quotes = {SYM: _quote()}
+
+    def boom():
+        raise RuntimeError("HTTP 500")
+    kis.get_cash_balance = boom
+    kis.get_stock_balance = boom
+    clock[0] = datetime(2026, 10, 20, 9, 10)
+    assert rt.tick() == 0                                          # 매수 차단
+    assert _trades(factory) == []
+
+
+def test_balance_failure_without_last_value_raises(factory, tmp_path):
+    kis = FakeKis()
+    rt, clock = _rt(factory, kis, tmp_path=tmp_path)
+    rt.prepare()
+    rt._last_cash = None
+
+    def boom():
+        raise RuntimeError("HTTP 500")
+    kis.get_cash_balance = boom
+    clock[0] = datetime(2026, 10, 20, 9, 10)
+    with pytest.raises(RuntimeError):
+        rt.tick()
+
+
+def test_notify_error_redacts_account(factory, tmp_path):
+    rt, _ = _rt(factory, tmp_path=tmp_path)
+    rt.notify_error("trading_tick", RuntimeError(
+        "500 for url: https://h/uapi/x/inquire-balance?CANO=12345678&ACNT_PRDT_CD=01"))
+    assert "12345678" not in rt.notifier.sent[-1]

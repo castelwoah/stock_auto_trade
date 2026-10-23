@@ -320,3 +320,17 @@ def test_pending_buy_counts_toward_cap(session):
     pipe.run_tick(_tick(current_prices={"A": 1000, "B": 1000}, liquidity=liq))
     qtys = [c.kwargs["qty"] for c in kis.order.call_args_list]
     assert qtys == [200, 100]                             # 200,000 + 100,000 = 상한
+
+
+def test_block_entries_reason_blocks_buys_only(session):
+    from dataclasses import replace as _replace
+
+    kis = _kis()
+    pipe = _pipe(session, kis=kis)
+    assert pipe.run_tick(_replace(_tick(), block_entries_reason="잔고 조회 실패")) == []
+    assert kis.order.call_count == 0
+
+    _seed_position(session)
+    pipe2 = _pipe(session, kis=kis, strategy=_StubSell())
+    executed = pipe2.run_tick(_replace(_tick(), block_entries_reason="잔고 조회 실패"))
+    assert [s.action for s in executed] == [Action.SELL]

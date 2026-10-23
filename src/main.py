@@ -24,6 +24,7 @@ import time
 from src.clients.discord import DiscordNotifier
 from src.clients.kis import KisClient
 from src.common.clock import now_kst, today_kst
+from src.common.redact import RedactingFormatter, register_secrets
 from src.config import get_settings
 from src.persistence.db import init_db, session_scope
 from src.reporting.archiver import Archiver
@@ -34,11 +35,26 @@ from src.runtime import TradingRuntime
 from src.scheduler.app import TradingScheduler, register_default_jobs
 
 
+LOG_FORMAT = "%(asctime)s %(levelname)s %(name)s: %(message)s"
+
+
 def _setup_logging() -> None:
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-    )
+    logging.basicConfig(level=logging.INFO, format=LOG_FORMAT)
+    for h in logging.getLogger().handlers:
+        h.setFormatter(RedactingFormatter(LOG_FORMAT))
+
+
+def _register_secrets(settings) -> None:
+    """로그·Discord 출력에서 값 그대로 가릴 비밀값 (계좌번호·키·웹훅)."""
+    dart = settings.DART_API_KEY.get_secret_value() if settings.DART_API_KEY else None
+    register_secrets([
+        settings.CANO,
+        f"{settings.CANO}-{settings.ACNT_PRDT_CD}",
+        settings.APP_KEY.get_secret_value(),
+        settings.APP_SECRET.get_secret_value(),
+        settings.DISCORD_WEBHOOK_URL.get_secret_value(),
+        dart,
+    ])
 
 
 def _make_job_handlers(settings, kis, notifier, runtime):
@@ -131,6 +147,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     settings = get_settings()
+    _register_secrets(settings)
     logging.info(
         "KIS_ENV=%s URL=%s SHADOW=%s MAX_DEPLOY_PCT=%s KILL=%s",
         settings.KIS_ENV.value, settings.URL_BASE, settings.SHADOW_MODE,

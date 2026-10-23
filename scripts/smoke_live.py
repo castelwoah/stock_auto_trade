@@ -193,6 +193,7 @@ def check_balance(kis: KisClient, rep: Report) -> int:
 def check_rate(rec: RawRecorder, rep: Report, symbol: str, n: int) -> None:
     """버킷 속도(프로파일 rps)로 n회 연속 조회 — KIS 가 초과로 거절하는지."""
     limited = errors = 0
+    rec.kis.get_retry_delays = ()      # 클라이언트 재시도가 초과 응답을 가리지 않게
     t0 = time.monotonic()
     for _ in range(n):
         try:

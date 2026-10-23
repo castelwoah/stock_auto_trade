@@ -53,6 +53,7 @@ class TradeRecord:
     order_dvsn: str = "00"   # 00=지정가 / 01=시장가
     status: str = "submitted"
     note: str | None = None
+    ts: datetime | None = None   # None 이면 DB 기본값(now_kst). 주문 관리자는 주입 시계를 넘긴다
 
 
 class LivePortfolio:
@@ -109,6 +110,8 @@ class LivePortfolio:
             status=rec.status,
             note=rec.note,
         )
+        if rec.ts is not None:
+            trade.ts = rec.ts
         self.session.add(trade)
         self.session.flush()
         return trade
@@ -135,6 +138,8 @@ class LivePortfolio:
             status=rec.status,
             note=rec.note,
         )
+        if rec.ts is not None:
+            trade.ts = rec.ts
         try:
             with self.session.begin_nested():
                 self.session.add(trade)

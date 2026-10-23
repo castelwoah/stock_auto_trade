@@ -49,6 +49,10 @@ class TickContext:
     portfolio_value: float | None = None
     # symbol → (시가총액 원, 20일 평균 거래대금 원). 누락 종목은 매수 fail-closed.
     liquidity: dict[str, tuple[float | None, float | None]] = field(default_factory=dict)
+    # 값이 있으면 이번 tick 신규 매수만 차단 (예: 잔고 조회 실패로 직전값 사용). 청산은 진행
+    block_entries_reason: str | None = None
+    # 전략 확장 입력 (StrategyContext.extras 로 전달 — 예: news_scores, entry_blocked)
+    extras: dict = field(default_factory=dict)
 
 
 KillSwitch = Callable[[], bool]
@@ -114,6 +118,9 @@ class TradingPipeline:
                 self.portfolio.update_highest_price(pos.symbol, pos.strategy_id, new_price=px)
 
         entries_allowed = not self._kill_switch_on()
+        if ctx.block_entries_reason:
+            logger.warning("new entries blocked this tick: %s", ctx.block_entries_reason)
+            entries_allowed = False
         positions_state = self.portfolio.positions_as_state(current_prices=ctx.current_prices)
         today = ctx.as_of.date()
         strat_ctx = StrategyContext(
@@ -124,6 +131,7 @@ class TradingPipeline:
             candidate_scores=ctx.candidate_scores,
             current_prices=ctx.current_prices,
             prev_day_ohlc=ctx.prev_day_ohlc,
+            extras=dict(ctx.extras),
         )
 
         executed: list[Signal] = []

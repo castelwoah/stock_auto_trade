@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import shutil
+import time
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -13,6 +14,7 @@ import requests
 from src.clients.rate_limiter import TokenBucket
 from src.config import Settings
 from src.common.clock import now_kst
+from src.common.redact import redact
 
 
 logger = logging.getLogger(__name__)
@@ -25,6 +27,34 @@ ORD_DVSN_LIMIT = "00"
 ALLOWED_ORD_DVSN = frozenset({ORD_DVSN_LIMIT})
 # 일별주문체결조회 연속조회 상한 (페이지 15~100건 → 충분)
 CCLD_MAX_PAGES = 20
+# 조회(GET) 재시도 대기 — 5xx·연결 오류·초당 한도 초과만. 주문(POST)은 재시도하지 않는다
+GET_RETRY_DELAYS: tuple[float, ...] = (0.5, 1.0)
+RATE_LIMIT_MSG_CD = "EGW00201"
+# 오류 메시지에 남길 응답 본문 길이
+ERROR_BODY_CHARS = 300
+
+
+class KisHttpError(requests.HTTPError):
+    """HTTP 4xx/5xx. requests 기본 메시지와 달리 URL 쿼리(CANO 포함)를 싣지 않고,
+    원인 진단용 응답 본문 앞부분을 가려서 싣는다."""
+
+    def __init__(self, status: int, path: str, body: str, *, response: Any = None) -> None:
+        super().__init__(f"HTTP {status} {path}: {body}", response=response)
+        self.status = status
+        self.path = path
+        self.body = body
+
+
+def _raise_for_status(res: Any, path: str) -> None:
+    status = int(getattr(res, "status_code", 200) or 200)
+    if status < 400:
+        return
+    body = str(getattr(res, "text", "") or "")[:ERROR_BODY_CHARS]
+    raise KisHttpError(status, path, redact(body), response=res)
+
+
+def _is_rate_limited(data: Any) -> bool:
+    return isinstance(data, dict) and data.get("msg_cd") == RATE_LIMIT_MSG_CD
 
 
 class KisOrderRejected(RuntimeError):
@@ -191,6 +221,8 @@ class KisClient:
         )
         self.token_store = token_store or TokenStore(settings.TOKEN_DIR)
         self._access_token: str | None = None
+        self.get_retry_delays: tuple[float, ...] = GET_RETRY_DELAYS
+        self._sleep = time.sleep
 
     # ------------------------------------------------------------------
     # Token management
@@ -216,7 +248,7 @@ class KisClient:
             data=json.dumps(body),
             timeout=self.timeout,
         )
-        res.raise_for_status()
+        _raise_for_status(res, "oauth2/tokenP")
         data = res.json()
         token = data["access_token"]
         expired = data["access_token_token_expired"]
@@ -247,19 +279,46 @@ class KisClient:
     def _get_with_cont(
         self, path: str, tr_id: str, params: dict[str, Any], *, tr_cont: str = ""
     ) -> tuple[dict[str, Any], str]:
-        """GET + 응답 헤더 tr_cont (연속조회: 'M'/'F' = 다음 페이지 있음)."""
-        self.bucket.acquire()
-        headers = self._headers(tr_id)
-        if tr_cont:
-            headers["tr_cont"] = tr_cont
-        res = requests.get(
-            f"{self.base_url}/{path}",
-            headers=headers,
-            params=params,
-            timeout=self.timeout,
-        )
-        res.raise_for_status()
-        return res.json(), res.headers.get("tr_cont", "")
+        """GET + 응답 헤더 tr_cont (연속조회: 'M'/'F' = 다음 페이지 있음).
+
+        5xx · 연결 오류 · 초당 한도 초과(EGW00201)는 get_retry_delays 간격으로 재시도.
+        한도 초과가 끝까지 이어지면 마지막 응답을 그대로 돌려준다 (호출측 rt_cd 검사).
+        """
+        attempts = len(self.get_retry_delays) + 1
+        for attempt in range(attempts):
+            last = attempt == attempts - 1
+            self.bucket.acquire()
+            headers = self._headers(tr_id)
+            if tr_cont:
+                headers["tr_cont"] = tr_cont
+            try:
+                res = requests.get(
+                    f"{self.base_url}/{path}",
+                    headers=headers,
+                    params=params,
+                    timeout=self.timeout,
+                )
+            except (requests.ConnectionError, requests.Timeout) as exc:
+                if last:
+                    raise KisHttpError(0, path, type(exc).__name__) from None
+                self._retry_wait(attempt, path, type(exc).__name__)
+                continue
+            status = int(getattr(res, "status_code", 200) or 200)
+            if status >= 500 and not last:
+                self._retry_wait(attempt, path, f"HTTP {status}")
+                continue
+            _raise_for_status(res, path)
+            data = res.json()
+            if _is_rate_limited(data) and not last:
+                self._retry_wait(attempt, path, RATE_LIMIT_MSG_CD)
+                continue
+            return data, res.headers.get("tr_cont", "")
+        raise AssertionError("unreachable")
+
+    def _retry_wait(self, attempt: int, path: str, why: str) -> None:
+        delay = self.get_retry_delays[attempt]
+        logger.warning("KIS GET %s %s — retry %d in %.1fs", path, why, attempt + 1, delay)
+        self._sleep(delay)
 
     def _post(self, path: str, tr_id: str, body: dict[str, Any]) -> dict[str, Any]:
         self.bucket.acquire()
@@ -269,7 +328,7 @@ class KisClient:
             data=json.dumps(body),
             timeout=self.timeout,
         )
-        res.raise_for_status()
+        _raise_for_status(res, path)
         return res.json()
 
     # ------------------------------------------------------------------

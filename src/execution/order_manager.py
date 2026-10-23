@@ -168,6 +168,7 @@ class OrderManager:
             order_dvsn="00",
             status=STATUS_SHADOW if self.shadow else STATUS_SUBMITTED,
             note=signal.reason,
+            ts=self._now(),
         ))
         if trade is None and signal.action == Action.SELL:
             # 청산은 거절·차단으로 끝났어도 다시 시도해야 한다 (손절이 하루 종일 막히지 않도록).
@@ -182,6 +183,7 @@ class OrderManager:
                     signal_id=signal.signal_id, idempotency_key=retry_key, order_id=None,
                     status=STATUS_SHADOW if self.shadow else STATUS_SUBMITTED,
                     note=f"re-attempt after rejected/blocked: {signal.reason}",
+                    ts=self._now(),
                 ))
         if trade is None:
             logger.warning("duplicate idempotency_key — order NOT sent: %s", idempotency_key)
@@ -495,6 +497,7 @@ class OrderManager:
             order_id=None,
             status=STATUS_SUBMITTED,
             note=f"retry {retry_no} of {po.idempotency_key}",
+            ts=self._now(),
         ))
         if trade is None:
             return
