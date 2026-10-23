@@ -370,3 +370,104 @@ def test_notify_error_redacts_account(factory, tmp_path):
     rt.notify_error("trading_tick", RuntimeError(
         "500 for url: https://h/uapi/x/inquire-balance?CANO=12345678&ACNT_PRDT_CD=01"))
     assert "12345678" not in rt.notifier.sent[-1]
+
+
+# --- news-universe-v1 ------------------------------------------------------------
+
+from src.strategy.universe import Universe, UniverseEntry  # noqa: E402
+
+NEWS_SYM = "111110"
+
+
+def _news_kis():
+    kis = FakeKis()
+    kis.quotes[NEWS_SYM] = _quote(NEWS_SYM, price=10_500.0, open_price=10_000.0, base_price=9_900.0)
+    kis.ohlc[NEWS_SYM] = {"open_today": "10000", "high": "10400", "low": "9800",
+                          "avg_trade_value_20d": str(5e11)}       # 목표가 10,300 → 돌파
+    return kis
+
+
+def _universe(now, *entries, blocked=()):
+    return Universe(built_at=now, mode="news_with_fallback", entries=tuple(entries),
+                    blocked=frozenset(blocked))
+
+
+def _rt_news(factory, kis, builder, tmp_path, **over):
+    clock = [datetime(2026, 10, 20, 9, 0)]
+    rt = TradingRuntime(
+        make_settings(KILL_SWITCH_FILE=tmp_path / "KILL", **over), kis, FakeNotifier(),
+        session_factory=factory, now_provider=lambda: clock[0], symbols=[SYM],
+        reconcile_sleep=lambda s: None, universe_builder=builder,
+    )
+    return rt, clock
+
+
+def test_news_universe_symbol_loaded_and_bought(factory, tmp_path):
+    kis = _news_kis()
+    built = []
+
+    def builder(now):
+        built.append(now)
+        return _universe(now, UniverseEntry(NEWS_SYM, "호재전자", "news", 85.0, 2, (7, 9)))
+    rt, clock = _rt_news(factory, kis, builder, tmp_path)
+    rt.prepare()
+    assert built and "뉴스 1 · 예비 0" in rt.notifier.sent[-1]
+    clock[0] = datetime(2026, 10, 20, 9, 10)
+    assert rt.tick() == 1
+    t = _trades(factory)[0]
+    assert t.symbol == NEWS_SYM and "news 85" in t.note and "art 7,9" in t.note
+    assert SYM not in {x.symbol for x in _trades(factory)}          # watchlist 종목은 매수 대상 아님
+
+
+def test_shadow_compare_records_both_lists_once(factory, tmp_path):
+    kis = _news_kis()
+    rt, clock = _rt_news(factory, kis, lambda now: _universe(
+        now, UniverseEntry(NEWS_SYM, "호재전자", "news", 85.0, 1, (1,))), tmp_path)
+    rt.prepare()
+    clock[0] = datetime(2026, 10, 20, 9, 10)
+    rt.tick()
+    clock[0] = datetime(2026, 10, 20, 9, 15)
+    rt.tick()
+    with factory() as s:
+        ev = {(e.action_taken, e.symbol) for e in s.query(RiskEvent).filter_by(event_type="shadow_compare")}
+        n = s.query(RiskEvent).filter_by(event_type="shadow_compare").count()
+    assert ev == {("universe", NEWS_SYM), ("static", SYM)} and n == 2
+
+
+def test_compare_disabled(factory, tmp_path):
+    kis = _news_kis()
+    rt, clock = _rt_news(factory, kis, lambda now: _universe(
+        now, UniverseEntry(NEWS_SYM, "", "news", 85.0)), tmp_path, UNIVERSE_COMPARE_STATIC=False)
+    rt.prepare()
+    clock[0] = datetime(2026, 10, 20, 9, 10)
+    rt.tick()
+    with factory() as s:
+        assert s.query(RiskEvent).filter_by(event_type="shadow_compare").count() == 0
+
+
+def test_blocked_symbol_not_bought(factory, tmp_path):
+    kis = _news_kis()
+    rt, clock = _rt_news(factory, kis, lambda now: _universe(
+        now, UniverseEntry(NEWS_SYM, "", "static"), blocked={NEWS_SYM}), tmp_path)
+    rt.prepare()
+    clock[0] = datetime(2026, 10, 20, 9, 10)
+    assert rt.tick() == 0
+
+
+def test_static_mode_never_builds(factory, tmp_path):
+    def builder(now):
+        raise AssertionError("must not be called")
+    rt, clock = _rt_news(factory, FakeKis(), builder, tmp_path, UNIVERSE_MODE="static")
+    rt.prepare()
+    clock[0] = datetime(2026, 10, 20, 9, 10)
+    assert rt.tick() == 1 and _trades(factory)[0].symbol == SYM
+
+
+def test_builder_failure_falls_back_to_watchlist(factory, tmp_path):
+    def builder(now):
+        raise RuntimeError("db locked")
+    rt, clock = _rt_news(factory, FakeKis(), builder, tmp_path)
+    rt.prepare()
+    assert rt.universe is None and rt.active_symbols() == [SYM]
+    clock[0] = datetime(2026, 10, 20, 9, 10)
+    assert rt.tick() == 1

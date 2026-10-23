@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from enum import Enum
 from functools import lru_cache
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 from urllib.parse import urlparse
 
 from pydantic import Field, SecretStr, field_validator, model_validator
@@ -95,6 +95,21 @@ class Settings(BaseSettings):
     # Reconciler 범위: False = 계좌 전체 비교(자동매매 전용 계좌 전제, 기본),
     # True = 봇이 다룬 종목만 비교(수동 보유 종목이 있는 계좌)
     RECONCILE_MANAGED_ONLY: bool = False
+
+    # --- 뉴스 기반 감시 종목 (news-universe-v1, 2026-10-23) ---
+    # static = 하드코딩 watchlist 만 (이전 동작) / news = 뉴스 후보 + 보유 /
+    # news_with_fallback = 뉴스 후보가 UNIVERSE_MIN_NEWS 미만이면 watchlist 로 UNIVERSE_MAX 까지 채움
+    UNIVERSE_MODE: Literal["static", "news", "news_with_fallback"] = "news_with_fallback"
+    UNIVERSE_MAX: int = Field(default=30, ge=1, le=60)
+    UNIVERSE_MIN_NEWS: int = Field(default=10, ge=0)
+    # 섀도 비교: 뉴스 모드에서도 watchlist 의 돌파 신호를 계산해 RiskEvent(shadow_compare) 로 기록
+    UNIVERSE_COMPARE_STATIC: bool = True
+    NEWS_MIN_SCORE: float = Field(default=60.0, ge=0.0, le=100.0)     # 후보 기준
+    NEWS_BLOCK_SCORE: float = Field(default=40.0, ge=0.0, le=100.0)   # 미만이면 당일 매수 금지
+    NEWS_MIN_CONFIDENCE: float = Field(default=0.8, ge=0.0, le=1.0)   # D4
+    NEWS_POLL_MINUTES: int = Field(default=10, ge=1, le=60)
+    NEWS_HALF_LIFE_HOURS: float = Field(default=12.0, gt=0.0)
+    MASTER_DIR: Path = Field(default_factory=lambda: PROJECT_ROOT / "data" / "master")
 
     def kill_switch_on(self) -> bool:
         return self.TRADING_DISABLED or self.KILL_SWITCH_FILE.exists()

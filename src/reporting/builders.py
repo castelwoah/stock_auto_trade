@@ -33,6 +33,8 @@ from src.reporting.models import (
     MidDayAnomaly,
     MidDaySnapshot,
     MorningStats,
+    NewsCandidate,
+    NewsUniverseSummary,
     PortfolioState,
     PositionSnapshot,
     RESULT_BLOCKED_RISK,
@@ -195,6 +197,8 @@ def build_daily_report(
     next_actions: list[str] | None = None,
     source_distribution: dict[str, int] | None = None,
     strategy_version: str = "v1.0",
+    names: dict[str, str] | None = None,
+    news_min_score: float = 60.0,
 ) -> DailyReport:
     """하루치 Trade·RiskEvent·NewsArticle·StockScore 를 종합해 DailyReport 생성."""
     trades = _load_trades_by_day(session, report_date)
@@ -224,6 +228,13 @@ def build_daily_report(
         .scalar() or 0
     )
 
+    if source_distribution is None:
+        source_distribution = dict(
+            session.query(NewsArticle.source, sa_func.count(NewsArticle.id))
+            .filter(NewsArticle.retrieved_at >= start, NewsArticle.retrieved_at <= end)
+            .group_by(NewsArticle.source).all()
+        )
+
     data_summary = DataCollectionSummary(
         news_count=int(news_count),
         source_distribution=source_distribution or {},
@@ -248,6 +259,42 @@ def build_daily_report(
         risk=risk or RiskStatus(),
         next_actions=list(next_actions or []),
         strategy_version=strategy_version,
+        news_universe=build_news_universe_summary(
+            session, report_date, names=names or {}, min_score=news_min_score),
+    )
+
+
+NEWS_UNIVERSE_VER = "news-universe-v1"   # strategy.universe.SCORING_VER (계층 역참조 회피)
+SHADOW_COMPARE_EVENT = "shadow_compare"
+
+
+def build_news_universe_summary(
+    session: Session, day: date, *, names: dict[str, str], min_score: float, top_n: int = 5,
+) -> NewsUniverseSummary | None:
+    """당일 뉴스 점수(StockScore news-universe-v1) + 섀도 비교 신호(RiskEvent). 둘 다 없으면 None."""
+    scores = (
+        session.query(StockScore)
+        .filter(StockScore.score_date == day, StockScore.scoring_ver == NEWS_UNIVERSE_VER)
+        .order_by(StockScore.news_score.desc(), StockScore.symbol)
+        .all()
+    )
+    start, end = _day_bounds(day)
+    events = (
+        session.query(RiskEvent.action_taken, RiskEvent.symbol)
+        .filter(RiskEvent.event_type == SHADOW_COMPARE_EVENT,
+                RiskEvent.ts >= start, RiskEvent.ts <= end)
+        .all()
+    )
+    if not scores and not events:
+        return None
+    cands = [s for s in scores if s.news_score >= min_score]
+    return NewsUniverseSummary(
+        scored_count=len(scores),
+        candidate_count=len(cands),
+        top=[NewsCandidate(symbol=s.symbol, name=names.get(s.symbol, ""), score=s.news_score)
+             for s in cands[:top_n]],
+        universe_signals=sorted({sym for g, sym in events if g == "universe" and sym}),
+        static_signals=sorted({sym for g, sym in events if g == "static" and sym}),
     )
 
 
@@ -269,6 +316,8 @@ def build_midday_snapshot(
     top_n_candidates: int = 5,
     strategy_version: str = "v1.0",
     cash_available: float = 0.0,
+    names: dict[str, str] | None = None,
+    candidate_min_score: float = 70.0,
 ) -> MidDaySnapshot:
     """12:00 시점 스냅샷 — 오전(09:10~12:00) 시도 + 현재 포지션 + 오후 후보."""
     day = ts.date()
@@ -328,7 +377,7 @@ def build_midday_snapshot(
         session.query(StockScore)
         .filter(
             StockScore.score_date == day,
-            StockScore.total_score >= 70,
+            StockScore.total_score >= candidate_min_score,
         )
         .order_by(StockScore.total_score.desc())
         .limit(top_n_candidates)
@@ -337,7 +386,7 @@ def build_midday_snapshot(
     top_candidates = [
         CandidateSnapshot(
             symbol=s.symbol,
-            name="",
+            name=(names or {}).get(s.symbol, ""),
             total_score=s.total_score,
             dominant_factor=_dominant_factor(s),
         )

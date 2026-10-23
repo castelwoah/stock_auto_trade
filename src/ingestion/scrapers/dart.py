@@ -37,12 +37,16 @@ class DartScraper(BaseScraper):
         self,
         api_key: str | None = None,
         corp_code_map: dict[str, str] | None = None,
+        *,
+        max_pages: int | None = None,
     ) -> None:
         if not api_key:
             raise ValueError("DartScraper requires OpenDART api_key")
         super().__init__()
         self.api_key = api_key
         self.corp_code_map = corp_code_map or {}
+        # 응답은 접수일 내림차순 (OpenDART 기본 sort=date, sort_mth=desc) → 최근 N 페이지만
+        self.max_pages = max_pages
 
     # ------------------------------------------------------------------
     # BaseScraper interface
@@ -58,7 +62,7 @@ class DartScraper(BaseScraper):
 
         page_no = 1
         total_page = 1  # 일단 1로 초기화, 첫 응답에서 갱신
-        while page_no <= total_page:
+        while page_no <= total_page and (self.max_pages is None or page_no <= self.max_pages):
             params = {
                 "crtfc_key": self.api_key,
                 "bgn_de": bgn_de,
@@ -112,6 +116,9 @@ class DartScraper(BaseScraper):
             mapped = self.corp_code_map.get(corp_code)
             if mapped:
                 symbols = (mapped,)
+        stock_code = str(row.get("stock_code") or "").strip()
+        if not symbols and len(stock_code) == 6:
+            symbols = (stock_code,)     # 상장사는 응답에 종목코드가 직접 실린다
 
         return Article(
             source=self.slug,

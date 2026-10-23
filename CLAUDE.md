@@ -35,10 +35,13 @@ mini_project/
 │   ├── ingestion/          # W2 신설
 │   │   ├── base_scraper.py # BaseScraper + Article dataclass (계약)
 │   │   ├── dedup.py        # URL 정규화 + SimHash64 + Hamming distance
-│   │   ├── symbol_resolver.py  # 종목명/코드 → symbol (GENERIC_STOPWORDS 반감, D4)
+│   │   ├── symbol_resolver.py  # 종목명/코드 → symbol (조사 허용 · 긴 이름 우선 단일 정규식 · 2글자 0.7 · 일반어 반감, D4)
+│   │   ├── master.py       # KIS 마스터 zip 수신·고정폭 파싱(뒷부분 KOSPI 227/KOSDAQ 221B) · 보통주 필터 · data/master/YYYYMMDD 보관 (D9)
+│   │   ├── collector.py    # 수집 → 중복 제거(ID·URL·SimHash) → NewsArticle(제목+요약) → ArticleSymbol
+│   │   ├── service.py      # NewsService — master_refresh / news_collect / universe 빌드 job 본체
 │   │   └── scrapers/
 │   │       ├── dart.py                # OpenDART list.json (실구현, 페이지네이션)
-│   │       ├── yonhap_rss.py          # 연합뉴스 RSS 2.0 (stdlib XML, 실구현)
+│   │       ├── yonhap_rss.py          # 연합뉴스 RSS 2.0 (economy·market·industry, stdlib XML)
 │   │       ├── naver_disclosure.py    # 스캐폴드 (TODO: HTML 실구현 + 법무)
 │   │       └── kis_news.py            # 스캐폴드 (TODO: KIS TR_ID 확정)
 │   ├── analysis/           # W3 신설
@@ -58,7 +61,8 @@ mini_project/
 │   ├── strategy/           # W5 신설
 │   │   ├── base.py          # Signal / Action enum / Strategy ABC / PositionState / StrategyContext
 │   │   ├── exit_signals.py  # SL -5% / TP +7% arm / Trailing -3% / event_exit / evaluate_exit / update_peak
-│   │   ├── breakout.py      # 변동성 돌파 legacy 포팅, 15:00 매수 중단 / 15:15 EOD 청산
+│   │   ├── breakout.py      # 변동성 돌파 legacy 포팅, 15:00 매수 중단 / 15:15 EOD 청산, 빈 자리는 뉴스 점수→돌파율 순
+│   │   ├── universe.py      # news-universe-v1: 보유 + 뉴스 후보 상위 N (+ watchlist 예비), 악재 차단, StockScore 기록
 │   │   ├── news_swing.py    # 뉴스 스코어 기반 스윙 (5~10종목, 당일 청산 없음)
 │   │   └── registry.py      # 서브포트폴리오 현금 할당 + 신호 라우팅 (D2 격리, 금지 영역)
 │   ├── reporting/          # W6 신설 (v3 확장)
@@ -82,11 +86,12 @@ mini_project/
 │   │   └── pipeline.py      # tick 체인: Registry → Risk → Order (trading_off·kill switch·투입 상한·고점 갱신)
 │   ├── scheduler/          # W8 신설
 │   │   ├── calendar.py      # KRX 2026 휴장일 (Agent), is_business_day / next·prev / business_days_between
-│   │   ├── watchlist.py     # 30종목 초기 watchlist (legacy 12 + KOSPI 10 + KOSDAQ 8, 블랙리스트 제외)
+│   │   ├── watchlist.py     # 29종목 예비 watchlist (legacy 12 + KOSPI 10 + KOSDAQ 7, 091990 상장폐지 제외)
 │   │   └── app.py           # APScheduler wrapper — 영업일 게이트 / misfire 300s / cron + interval 헬퍼
 │   ├── main.py             # W8 엔트리포인트 — config→clients→runtime→scheduler wire-up, SIGINT/SIGTERM graceful shutdown
 │   ├── runtime.py          # Phase A: TradingRuntime — 09:00 prepare / 5분 tick 본체 (시세·종목상태·지수 → pipeline)
 │   ├── common/clock.py     # now_kst / today_kst — 시각 단일 기준 KST
+│   ├── common/redact.py    # 로그·Discord 민감정보 가리기 (비밀값·URL 쿼리·웹훅·Bearer) + RedactingFormatter
 │   └── persistence/        # W2 신설
 │       ├── db.py           # SQLAlchemy engine/session, session_scope, init_db
 │       └── models.py       # 8 tables: NewsArticle, ArticleSymbol, StockScore, Trade(idem UNIQUE), Position(symbol+strategy_id PK), RiskEvent, DailyPnl, CashFlow
@@ -509,7 +514,19 @@ W8 (모의투자)   → 단일 세션 (관찰·튜닝)
     - **테스트**: 477 → **652 pass**, 전체 커버리지 91% (kis 98% / execution 96~100% / runtime 96% / risk 100%).
 - **스모크 테스트 스크립트** `scripts/smoke_live.py` (runbook §1.2) — 아래 가정값을 R1·R2·O2·O3 로 판정. 원주문 행 `cncl_yn`(수동취소 감지 근거)도 함께 확인.
 - **확인 필요 (실전 스모크 테스트)**: `hts_avls` 단위(억원 가정), `vi_cls_code` 값 체계, `mrkt_warn_cls_code` 01/02/03 의미, 체결조회 `ord_gno_brno` = 주문 응답 `KRX_FWDG_ORD_ORGNO` 가정, 실전 초당 한도.
-- **알려진 제약**: 섀도 모드의 매수는 미체결 추적을 하지 않아 상한 계산이 실전보다 느슨함. 하한가 근처 매도는 가격제한폭 거절 가능(재시도 5회 후 수동 대응). Circuit Breaker 의 연속 손실일 입력(`DailyPnl` 기록)은 Phase B.
+- **알려진 제약(Phase A)**: 섀도 모드의 매수는 미체결 추적을 하지 않아 상한 계산이 실전보다 느슨함. 하한가 근처 매도는 가격제한폭 거절 가능(재시도 5회 후 수동 대응). Circuit Breaker 의 연속 손실일 입력(`DailyPnl` 기록)은 Phase B.
+
+### 2026-10-23
+- **장애 분석 (10-23)**: 잔고 조회 HTTP 500 (KIS 측 일시 오류 추정, 약 600회 중 5회) → tick 전체 중단 + Discord/`main.err` 에 **계좌번호 노출** (requests 오류 메시지의 쿼리스트링). 실제 매매 중단 원인은 036630 reconcile 불일치 (legacy 봇 보유 추정).
+- **P0·P1·P2** (`088d2a1`): `common/redact.py` + 로그 포매터·Discord·`notify_error` 가리기, `KisHttpError`(쿼리 미포함 + 응답 본문 300자). KIS GET 만 5xx·연결오류·EGW00201 재시도(0.5/1s, 3회), POST 재시도 없음. 잔고 실패 시 직전값 + 해당 tick 매수만 차단. 로그 파일 사전 생성.
+- **news-universe-v1 (사용자 결정: 권장안 전부 채택)**: 뉴스 → 종목 → 감시 종목, 매수 판단은 기존 변동성 돌파 그대로.
+    - 결정값: `UNIVERSE_MODE=news_with_fallback`, 상한 30 / 예비 채움 기준 10, 후보 60점 / 악재 40점, 확신도 0.8, 10분 수집, 반감기 12h, 매수 순서 뉴스 점수→돌파율. DART 는 키 발급 시 자동 사용.
+    - 발견·수정한 결함: 마스터 파서가 실제 고정폭 형식을 못 읽음(0종목), 조사 붙은 종목명 미매칭(`삼성전자가`), 연합 finance/stock 피드 404, news_collect/analyze_score stub.
+    - 마스터 형식 주의: 뒷부분 길이는 **줄바꿈 제외** KOSPI 227 / KOSDAQ 221 바이트, 그룹코드 = 뒷부분 [0:2] (공식 예제의 228/222 는 줄바꿈 포함 길이).
+    - 섀도 비교: 감시 종목과 watchlist 의 돌파 신호를 `RiskEvent(event_type='shadow_compare', action_taken=universe|static)` 로 하루 1회씩 기록 (스키마 무변경), 일일 리포트 "■ 뉴스 감시 종목".
+    - 실데이터 점검(10-23 장중, 임시 DB): 마스터 보통주 2,535 · 연합 341건 중 신규 265 · 종목 링크 88(≥0.8: 75) · 후보 1 · 악재 차단 15 (삼성전자·SK하이닉스 포함 — 당일 반도체 급락 기사). 룰 감성 v1 은 긍정 키워드가 적어 후보가 적고, 키워드 1개로도 차단된다(예: '제재'). B1 관찰 기간에 측정·조정 대상.
+    - 테스트 666 → **731 pass**. 신규 모듈 커버리지 95~100%.
+- **진행 순서**: B1(수집·리포트 관찰 2~3영업일) → B2(섀도 비교 3영업일) → B3(`SHADOW_MODE: false`, 사용자 판단).
 
 ## Notes
 

@@ -12,6 +12,9 @@ from src.config import get_settings
 from src.persistence.models import Base
 
 
+SQLITE_BUSY_TIMEOUT_SEC = 30
+
+
 @lru_cache(maxsize=1)
 def get_engine() -> Engine:
     settings = get_settings()
@@ -20,6 +23,8 @@ def get_engine() -> Engine:
     connect_args: dict = {}
     if settings.DATABASE_URL.startswith("sqlite"):
         connect_args["check_same_thread"] = False
+        # 뉴스 수집 job 과 trading tick 이 다른 스레드에서 쓴다 → 잠금 대기를 기본 5초보다 길게
+        connect_args["timeout"] = SQLITE_BUSY_TIMEOUT_SEC
     return create_engine(
         settings.DATABASE_URL,
         connect_args=connect_args,

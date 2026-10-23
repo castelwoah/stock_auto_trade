@@ -1,7 +1,9 @@
-"""Paper trading watchlist — rules §3.1 + v2 개선점 C6.
+"""예비 watchlist — rules §3.1 + v2 개선점 C6.
 
-초기 30종목: legacy symbol_dict 12 + 시총 상위 18 (KOSPI 10 + KOSDAQ 8).
-블랙리스트 자동 제외. 매주 금요일 16:00 재평가 예정 (W8 이후).
+news-universe-v1 (2026-10-23) 이후 역할: UNIVERSE_MODE=static 일 때의 감시 종목이자,
+news_with_fallback 에서 뉴스 후보가 모자랄 때 채우는 예비 목록.
+29종목: legacy symbol_dict 12 + 시총 상위 17 (KOSPI 10 + KOSDAQ 7).
+091990 셀트리온헬스케어는 상장폐지(종목 마스터 부재 확인)로 제외. 블랙리스트 자동 제외.
 """
 from __future__ import annotations
 
@@ -44,7 +46,6 @@ TOP_MARKET_CAP_KOSPI: dict[str, str] = {
 TOP_MARKET_CAP_KOSDAQ: dict[str, str] = {
     "247540": "에코프로비엠",
     "086520": "에코프로",
-    "091990": "셀트리온헬스케어",
     "196170": "알테오젠",
     "240810": "원익IPS",
     "039030": "이오테크닉스",

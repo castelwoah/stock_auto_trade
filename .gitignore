@@ -11,6 +11,7 @@ expired/
 # 종목코드 마스터 파일
 *.mst
 *.mst.zip
+data/
 
 # 로그 파일
 *.log

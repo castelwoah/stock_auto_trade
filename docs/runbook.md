@@ -25,6 +25,13 @@
 | `KILL_SWITCH_FILE` | `run/TRADING_DISABLED` | **파일이 존재하면 즉시 신규 매수 차단** (재시작 불필요, 청산은 계속) |
 | `ALLOC_BREAKOUT_PCT` / `ALLOC_NEWS_SWING_PCT` | `20` / `0` | 전략별 현금 배분 % |
 | `RECONCILE_MANAGED_ONLY` | `false` | `true` 면 봇이 다룬 종목만 잔고 대조 (수동 보유 종목이 있는 계좌) |
+| `UNIVERSE_MODE` | `news_with_fallback` | 감시 종목. `static` = 하드코딩 watchlist 만 (**뉴스 기능 즉시 되돌리기**, 재시작) / `news` = 뉴스 후보 + 보유만 / `news_with_fallback` = 뉴스 후보가 `UNIVERSE_MIN_NEWS` 미만이면 watchlist 로 `UNIVERSE_MAX` 까지 채움 |
+| `UNIVERSE_MAX` / `UNIVERSE_MIN_NEWS` | `30` / `10` | 감시 종목 상한(보유 제외) / 예비 목록을 채우는 기준 |
+| `NEWS_MIN_SCORE` / `NEWS_BLOCK_SCORE` | `60` / `40` | 뉴스 후보 기준 / 감성 기사가 있고 이 점수 미만이면 당일 매수 금지 |
+| `NEWS_MIN_CONFIDENCE` | `0.8` | 기사↔종목 매칭 확신도 하한 (D4) |
+| `NEWS_POLL_MINUTES` / `NEWS_HALF_LIFE_HOURS` | `10` / `12` | 수집 간격(08:00~14:50) / 뉴스 점수 반감기 |
+| `UNIVERSE_COMPARE_STATIC` | `true` | 섀도 비교 — watchlist 돌파 신호를 `RiskEvent(shadow_compare)` 로 기록, 일일 리포트에서 나란히 표시 |
+| `DART_API_KEY` | 없음 | 있으면 OpenDART 공시도 수집 (종목코드 직접 매핑) |
 
 긴급 매수 중단: `touch $PROJECT_ROOT/run/TRADING_DISABLED` → 해제: `rm $PROJECT_ROOT/run/TRADING_DISABLED`
 
@@ -57,9 +64,9 @@
 
 | 시각 | 알림 | 의미 |
 |------|------|------|
-| 07:30 | `master updated` | KOSPI/KOSDAQ 종목 마스터 파일 갱신 완료 |
-| 08:30 | `news fetch done` | 뉴스 수집 완료 |
-| 09:00 | `start_equity fixed` + `reconciler.verify() OK` | 시작 자산 고정 및 잔고 정합성 확인 |
+| 07:30 | (로그) `master 2026MMDD vs …` | 종목 마스터 갱신 — 실패 시에만 Discord `[master_refresh] 종목 마스터 없음` |
+| 08:00~14:50 | (로그) `news_collect: fetched …` · `universe HH:MM: …` | 10분마다 뉴스 수집 → 감시 종목 재구성 |
+| 09:00 | `[prepare]` (감시 종목: 뉴스 n · 예비 n · 보유 n) | 시작 자산 고정 · 잔고 정합성 · 감시 종목 구성 |
 | 09:10 | `trading loop started` | 메인 매매 루프 가동 |
 | 16:00 | `daily report` | 일일 리포트 수신 |
 

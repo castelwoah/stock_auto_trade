@@ -28,7 +28,7 @@ def test_dry_run_registers_seven_jobs(patched, caplog):
 
 def test_prepare_and_tick_delegate_to_runtime(patched):
     settings, rt = patched
-    jobs = main_mod._make_job_handlers(settings, MagicMock(), MagicMock(), rt)
+    jobs = main_mod._make_job_handlers(settings, MagicMock(), MagicMock(), rt, MagicMock())
     jobs["prepare_state"]()
     jobs["trading_tick"]()
     rt.prepare.assert_called_once()
@@ -40,7 +40,7 @@ def test_handler_exception_is_isolated_and_notified(patched, job, method):
     settings, rt = patched
     err = RuntimeError("boom")
     getattr(rt, method).side_effect = err
-    jobs = main_mod._make_job_handlers(settings, MagicMock(), MagicMock(), rt)
+    jobs = main_mod._make_job_handlers(settings, MagicMock(), MagicMock(), rt, MagicMock())
     jobs[job]()   # 예외가 밖으로 나가지 않아야 함
     rt.notify_error.assert_called_once_with(job, err)
 
@@ -48,6 +48,33 @@ def test_handler_exception_is_isolated_and_notified(patched, job, method):
 def test_daily_report_closes_runtime_even_on_failure(patched, monkeypatch):
     settings, rt = patched
     monkeypatch.setattr(main_mod, "session_scope", MagicMock(side_effect=RuntimeError("db")))
-    jobs = main_mod._make_job_handlers(settings, MagicMock(), MagicMock(), rt)
+    jobs = main_mod._make_job_handlers(settings, MagicMock(), MagicMock(), rt, MagicMock())
     jobs["daily_report"]()
     rt.close.assert_called_once()
+
+
+def test_news_collect_refreshes_universe_even_if_collect_fails(patched):
+    settings, rt = patched
+    news = MagicMock()
+    news.collect.side_effect = RuntimeError("rss down")
+    jobs = main_mod._make_job_handlers(settings, MagicMock(), MagicMock(), rt, news)
+    jobs["news_collect"]()
+    rt.refresh_universe.assert_called_once()
+
+
+def test_news_collect_static_mode_skips_universe(monkeypatch):
+    settings = make_settings(UNIVERSE_MODE="static")
+    rt, news = MagicMock(), MagicMock()
+    jobs = main_mod._make_job_handlers(settings, MagicMock(), MagicMock(), rt, news)
+    jobs["news_collect"]()
+    news.collect.assert_called_once()
+    rt.refresh_universe.assert_not_called()
+
+
+def test_master_refresh_failure_is_isolated(patched):
+    settings, rt = patched
+    news = MagicMock()
+    news.refresh_master.side_effect = RuntimeError("dl")
+    jobs = main_mod._make_job_handlers(settings, MagicMock(), MagicMock(), rt, news)
+    jobs["master_refresh"]()
+    rt.notify_error.assert_called_once()

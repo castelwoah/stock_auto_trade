@@ -165,3 +165,14 @@ def test_uses_api_key_and_default_date_range():
     assert params["bgn_de"] == params["end_de"]
     assert params["page_count"] == 100
     assert params["page_no"] == 1
+
+
+def test_stock_code_maps_symbol_and_max_pages():
+    scraper = DartScraper(api_key="dummy", max_pages=1)
+    scraper.min_interval_sec = 0.0
+    row = dict(_row("20261023000001"), stock_code="005930")
+    page = {"status": "000", "total_page": 5, "list": [row, _row("20261023000002")]}
+    with patch("src.ingestion.base_scraper.requests.get", return_value=_mock_response(page)) as g:
+        arts = list(scraper.fetch())
+    assert g.call_count == 1                       # 최근 1 페이지만
+    assert arts[0].symbols == ("005930",) and arts[1].symbols == ()

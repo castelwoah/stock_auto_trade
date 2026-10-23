@@ -2,8 +2,8 @@
 
 타임라인 (KST, 영업일만):
   07:30  master 갱신 (D9)
-  08:00  뉴스 수집
-  08:30  감성 분석 + 팩터 계산 + 스코어링
+  08:00~14:50  뉴스 수집 (NEWS_POLL_MINUTES 간격) → 감시 종목 재구성
+  08:50  감시 종목 구성 (장 시작 전 확정본)
   09:00  DailyLossState.start_equity 고정 (D7) + reconciler.verify()
   09:10~15:00  본 트레이딩 루프 (5분 간격 tick)
   15:00~15:20  청산 전용 (신규 매수 없음)
@@ -127,17 +127,21 @@ def register_default_jobs(
     trading_tick: SchedulerJob,
     midday_report: SchedulerJob,     # v3 추가
     daily_report: SchedulerJob,
+    news_poll_minutes: int = 10,
 ) -> dict[str, str]:
     """rules §5.1 타임라인 + v3 미드데이 리포트 타임라인에 맞춰 기본 작업 등록.
 
     타임라인 (영업일만):
-      07:30 master / 08:00 news / 08:30 score / 09:00 state /
+      07:30 master / 08:00~14:50 news (간격 news_poll_minutes) / 08:50 universe / 09:00 state /
       09:10~15:20 tick / **12:00 midday** / 16:00 report
     """
     out: dict[str, str] = {}
     out["master_refresh"] = sched.add_cron(master_refresh, name="master_refresh", hour=7, minute=30)
-    out["news_collect"] = sched.add_cron(news_collect, name="news_collect", hour=8, minute=0)
-    out["analyze_score"] = sched.add_cron(analyze_score, name="analyze_score", hour=8, minute=30)
+    out["news_collect"] = sched.add_interval_window(
+        news_collect, name="news_collect",
+        start=time(8, 0), end=time(14, 50), step_min=news_poll_minutes,
+    )
+    out["analyze_score"] = sched.add_cron(analyze_score, name="analyze_score", hour=8, minute=50)
     out["prepare_state"] = sched.add_cron(prepare_state, name="prepare_state", hour=9, minute=0)
     out["trading_tick"] = sched.add_interval_window(
         trading_tick, name="trading_tick",

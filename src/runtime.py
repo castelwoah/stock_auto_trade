@@ -6,6 +6,9 @@
   - StrategyRegistry (당일 실행 signal_id 를 DB 에서 복원 — 재시작 중복 차단)
   - OrderManager (당일 미종결 주문을 DB 에서 복원)
   - 시장 데이터: 전일 OHLC·20일 평균 거래대금(09:00), 시세·종목 상태(매 tick)
+  - 감시 종목: UNIVERSE_MODE 에 따라 watchlist(static) 또는 뉴스 universe
+    (universe_builder 가 만들고 뉴스 수집 job 이 refresh_universe 로 교체).
+    새로 들어온 종목은 다음 tick 에서 전일 OHLC 를 조회한다.
 
 데이터 누락은 fail-closed: 시세가 없는 종목은 신호 대상에서 빠지고, 유동성
 데이터가 없는 종목은 RiskEngine 이 매수를 차단한다.
@@ -39,15 +42,20 @@ from src.risk.blacklist import (
 )
 from src.risk.limits import CircuitBreakerState, DailyLossState, RiskEngine
 from src.risk.market_state import MarketState
+from src.persistence.models import RiskEvent
 from src.scheduler.watchlist import build_initial_watchlist, symbols_of
+from src.strategy.breakout import compute_target_price
 from src.strategy.breakout import BreakoutStrategy
 from src.strategy.news_swing import NewsSwingStrategy
 from src.strategy.registry import StrategyRegistry
+from src.strategy.universe import MODE_STATIC, Universe
 
 
 logger = logging.getLogger(__name__)
 
 ERROR_NOTICE_INTERVAL = timedelta(minutes=30)
+COMPARE_EVENT = "shadow_compare"
+COMPARE_CUTOFF = time(15, 0)       # breakout 신규 매수 중단 시각과 동일
 # mrkt_warn_cls_code → 블랙리스트 사유 (01 주의 / 02 경고 / 03 위험 — 코드 의미는 가정)
 _MARKET_WARNING = {"01": CAUTION, "02": WARNING, "03": RISK}
 
@@ -92,13 +100,18 @@ class TradingRuntime:
         now_provider: Callable[[], datetime] = now_kst,
         symbols: list[str] | None = None,
         reconcile_sleep: Callable[[float], None] | None = None,
+        universe_builder: Callable[[datetime], Universe] | None = None,
     ) -> None:
         self.settings = settings
         self.kis = kis
         self.notifier = notifier
         self._session_factory = session_factory or get_session_factory()
         self._now = now_provider
+        # 예비 watchlist (UNIVERSE_MODE=static 이면 이것만 감시)
         self.symbols = symbols if symbols is not None else symbols_of(build_initial_watchlist())
+        self._universe_builder = universe_builder
+        self.universe: Universe | None = None     # 참조 교체만 하므로 job 스레드 간 공유 안전
+        self._compare_seen: set[tuple[str, str]] = set()
         self._reconcile_sleep = reconcile_sleep
         self.session: Session | None = None
         self.pipeline: TradingPipeline | None = None
@@ -157,6 +170,10 @@ class TradingRuntime:
         if not recon.ok:
             self.pipeline.set_trading_off(True, reason=f"reconcile mismatch: {recon.detail}")
 
+        if self.universe is None or self.universe.built_at.date() != now.date():
+            self.session.commit()      # 쓰기 잠금 해제 — builder 는 별도 세션으로 StockScore 를 쓴다
+            self.refresh_universe(now)
+        self._compare_seen = self._load_compare_seen(day_start, day_end)
         self._load_daily_data()
         self.session.commit()
         self.prepared_for = now.date()
@@ -165,7 +182,8 @@ class TradingRuntime:
         lines = [
             f"[prepare] {now:%Y-%m-%d %H:%M} {self.settings.KIS_ENV.value} / {mode}",
             f"시작 평가액 {start_equity:,.0f}원 · 투입 상한 {cap:,.0f}원 ({self.settings.MAX_DEPLOY_PCT}%)",
-            f"전략: {', '.join(s.strategy_id for s in registry.strategies()) or '없음'} · 감시 {len(self.symbols)}종목 · 복원 주문 {restored}건",
+            f"전략: {', '.join(s.strategy_id for s in registry.strategies()) or '없음'} · 감시 {len(self.active_symbols())}종목 · 복원 주문 {restored}건",
+            f"감시 종목: {self._universe_label()}",
             f"Reconcile: {'OK' if recon.ok else 'MISMATCH → 매매 OFF: ' + recon.detail}",
         ]
         if late:
@@ -192,26 +210,33 @@ class TradingRuntime:
             self.prepare()
         assert self.pipeline is not None and self.session is not None
 
-        self._refresh_missing_open()
+        universe = self._active_universe()
+        active = set(universe.symbols) if universe is not None else set(self.symbols)
+        compare = set(self.symbols) if self._comparing(universe) else set()
         held = {p.symbol for p in self.pipeline.portfolio.iter_open_positions()}
-        quotes = self._fetch_quotes(sorted(set(self.symbols) | held))
+        self._ensure_daily_data(active | compare)
+        quotes = self._fetch_quotes(sorted(active | held | compare))
         self._apply_market_state(quotes)
+        tradable = {s: q for s, q in quotes.items() if s in active or s in held}
 
         cash, equity, stale = self._read_account()
         ctx = TickContext(
             as_of=now,
             cash_available=cash,
-            current_prices={s: q.price for s, q in quotes.items()},
+            current_prices={s: q.price for s, q in tradable.items()},
             prev_day_ohlc=self.prev_day_ohlc,
             portfolio_value=equity,
             block_entries_reason=stale,
             liquidity={
                 s: (q.market_cap or None, self.avg_trade_value.get(s) or None)
-                for s, q in quotes.items()
+                for s, q in tradable.items()
             },
+            extras=self._universe_extras(universe),
         )
         try:
             executed = self.pipeline.run_tick(ctx)
+            if compare:
+                self._record_compare(now, quotes, {"universe": active - held, "static": compare})
             self.session.commit()
         except Exception:
             self.session.rollback()
@@ -219,6 +244,78 @@ class TradingRuntime:
         if executed:
             logger.info("tick %s executed %d signals", now.time(), len(executed))
         return len(executed)
+
+    # ------------------------------------------------------------------
+    # universe
+    # ------------------------------------------------------------------
+    def refresh_universe(self, now: datetime | None = None) -> Universe | None:
+        """뉴스 universe 재구성. 실패하면 직전 universe(없으면 watchlist)를 유지."""
+        if self._universe_builder is None or self.settings.UNIVERSE_MODE == MODE_STATIC:
+            return None
+        now = now or self._now()
+        try:
+            u = self._universe_builder(now)
+        except Exception:
+            logger.exception("universe build failed — keeping previous")
+            return None
+        self.universe = u
+        return u
+
+    def active_symbols(self) -> list[str]:
+        u = self._active_universe()
+        return u.symbols if u is not None else list(self.symbols)
+
+    def _active_universe(self) -> Universe | None:
+        if self.settings.UNIVERSE_MODE == MODE_STATIC:
+            return None
+        return self.universe
+
+    def _comparing(self, universe: Universe | None) -> bool:
+        return universe is not None and self.settings.UNIVERSE_COMPARE_STATIC
+
+    def _universe_label(self) -> str:
+        u = self._active_universe()
+        if u is None:
+            return f"watchlist {len(self.symbols)} (mode={self.settings.UNIVERSE_MODE})"
+        return f"{u.summary()} (mode={u.mode}, {u.built_at:%H:%M} 기준)"
+
+    @staticmethod
+    def _universe_extras(u: Universe | None) -> dict:
+        if u is None:
+            return {}
+        return {
+            "news_scores": u.news_scores,
+            "entry_blocked": u.blocked,
+            "news_articles": {e.symbol: e.article_ids for e in u.entries if e.article_ids},
+        }
+
+    def _load_compare_seen(self, start: datetime, end: datetime) -> set[tuple[str, str]]:
+        rows = self.session.query(RiskEvent.action_taken, RiskEvent.symbol).filter(
+            RiskEvent.event_type == COMPARE_EVENT, RiskEvent.ts >= start, RiskEvent.ts <= end,
+        ).all()
+        return {(g or "", s or "") for g, s in rows}
+
+    def _record_compare(self, now: datetime, quotes: dict[str, Quote],
+                        groups: dict[str, set[str]]) -> None:
+        """섀도 비교: 그룹(universe / static)별로 돌파 조건을 처음 만족한 종목을 하루 1회 기록.
+        슬롯·현금·리스크와 무관한 순수 신호 — 리포트에서 두 목록의 신호를 나란히 본다."""
+        if now.time() >= COMPARE_CUTOFF:
+            return
+        for group, syms in groups.items():
+            for sym in sorted(syms):
+                if (group, sym) in self._compare_seen:
+                    continue
+                q, o = quotes.get(sym), self.prev_day_ohlc.get(sym)
+                if q is None or not o or min(o["open_today"], o["high"], o["low"]) <= 0:
+                    continue
+                target = compute_target_price(o["open_today"], o["high"], o["low"])
+                if q.price <= target:
+                    continue
+                self.session.add(RiskEvent(
+                    ts=now, event_type=COMPARE_EVENT, symbol=sym, action_taken=group,
+                    detail=f"{group} breakout {q.price:.0f} > {target:.0f}",
+                ))
+                self._compare_seen.add((group, sym))
 
     def close(self) -> None:
         if self.session is not None:
@@ -273,8 +370,18 @@ class TradingRuntime:
         return float(self.kis.get_cash_balance())
 
     def _load_daily_data(self) -> None:
-        for sym in self.symbols:
+        syms = set(self.active_symbols())
+        if self._comparing(self._active_universe()):
+            syms |= set(self.symbols)
+        for sym in sorted(syms):
             self._load_ohlc(sym)
+
+    def _ensure_daily_data(self, symbols: set[str]) -> None:
+        """universe 에 새로 들어온 종목은 전일 OHLC 조회, 당일 시가 미확정 종목은 재조회."""
+        for sym in sorted(symbols):
+            o = self.prev_day_ohlc.get(sym)
+            if o is None or o.get("open_today", 0) <= 0:
+                self._load_ohlc(sym)
 
     def _load_ohlc(self, sym: str) -> None:
         try:
@@ -290,12 +397,6 @@ class TradingRuntime:
             "low": float(o.get("low") or 0),
         }
         self.avg_trade_value[sym] = float(o.get("avg_trade_value_20d") or 0)
-
-    def _refresh_missing_open(self) -> None:
-        """09:00 준비 시점엔 당일 시가가 없을 수 있다 → 시가가 채워질 때까지 재조회."""
-        for sym, o in list(self.prev_day_ohlc.items()):
-            if o.get("open_today", 0) <= 0:
-                self._load_ohlc(sym)
 
     def _fetch_quotes(self, symbols: list[str]) -> dict[str, Quote]:
         out: dict[str, Quote] = {}

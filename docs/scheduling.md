@@ -100,8 +100,8 @@ sudo systemctl enable --now mini-trading-start.timer
 | 일 04:00 | crontab | 7일 이상 경과 DB 백업 삭제 |
 | **07:00** | **systemd timer** | **데몬 기동** |
 | 07:30 | APScheduler (내부) | KOSPI/KOSDAQ master 갱신 (D9) |
-| 08:00 | APScheduler | 뉴스 수집 (DART, 연합 RSS) |
-| 08:30 | APScheduler | 팩터 계산 + 스코어링 |
+| 08:00~14:50 | APScheduler | 뉴스 수집 (연합 RSS + DART 키 있으면), `NEWS_POLL_MINUTES` 간격 → 감시 종목 재구성 |
+| 08:50 | APScheduler | 감시 종목 구성 (장 시작 전 확정본, `StockScore news-universe-v1` 기록) |
 | 09:00 | APScheduler | DailyLossState start_equity 고정 (D7) + reconciler.verify (D6) |
 | 09:10~15:20 | APScheduler | 5분 간격 trading tick |
 | 15:00 | (내부) | 신규 매수 cut-off |

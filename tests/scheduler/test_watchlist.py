@@ -8,9 +8,10 @@ from src.scheduler.watchlist import (
 )
 
 
-def test_default_watchlist_size_30():
+def test_default_watchlist_size_29():
     wl = build_initial_watchlist()
-    assert len(wl) == 30
+    assert len(wl) == 29                      # 091990 상장폐지 제외 (2026-10-23)
+    assert "091990" not in symbols_of(wl)
 
 
 def test_legacy_first():
@@ -49,7 +50,7 @@ def test_max_size_truncates():
 def test_symbol_maps_shapes():
     assert len(LEGACY_SYMBOLS) == 12
     assert len(TOP_MARKET_CAP_KOSPI) == 10
-    assert len(TOP_MARKET_CAP_KOSDAQ) == 8
+    assert len(TOP_MARKET_CAP_KOSDAQ) == 7
 
 
 def test_no_duplicates():

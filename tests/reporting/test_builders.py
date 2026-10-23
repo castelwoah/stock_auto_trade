@@ -293,3 +293,41 @@ def test_midday_dominant_factor_detection(session):
     session.commit()
     snap = build_midday_snapshot(session, ts=datetime(2026, 4, 20, 12, 0))
     assert snap.top_candidates[0].dominant_factor == "news"
+
+
+# ============================================================================
+# news-universe-v1 요약
+# ============================================================================
+
+def test_daily_report_news_universe_summary(session):
+    from src.reporting.daily_report import render_embed, render_text
+
+    _add_score(session, symbol="111110", news_score=85, total_score=85, scoring_ver="news-universe-v1")
+    _add_score(session, symbol="222220", news_score=55, total_score=55, scoring_ver="news-universe-v1")
+    _add_score(session, symbol="A", news_score=99, total_score=99, scoring_ver="v1")      # 다른 버전
+    _add_risk_block(session, event_type="shadow_compare", symbol="111110", action_taken="universe")
+    _add_risk_block(session, event_type="shadow_compare", symbol="005930", action_taken="static")
+    _add_risk_block(session, event_type="shadow_compare", symbol="111110", action_taken="static")
+    r = build_daily_report(session, report_date=date(2026, 4, 20), names={"111110": "호재전자"})
+    nu = r.news_universe
+    assert (nu.scored_count, nu.candidate_count) == (2, 1)
+    assert nu.top[0].name == "호재전자" and nu.universe_signals == ["111110"]
+    assert nu.static_signals == ["005930", "111110"]
+    assert r.trades.risk_block_count == 0                    # 섀도 비교는 리스크 차단 집계에 안 섞임
+    text = render_text(r)
+    assert "■ 뉴스 감시 종목" in text and "호재전자 85" in text and "겹침 1" in text
+    assert any(f["name"] == "■ 뉴스 감시 종목" for f in render_embed(r)["fields"])
+
+
+def test_daily_report_without_news_has_no_section(session):
+    from src.reporting.daily_report import render_text
+
+    r = build_daily_report(session, report_date=date(2026, 4, 20))
+    assert r.news_universe is None and "뉴스 감시 종목" not in render_text(r)
+
+
+def test_midday_candidates_use_threshold_and_names(session):
+    _add_score(session, symbol="111110", news_score=65, total_score=65, scoring_ver="news-universe-v1")
+    snap = build_midday_snapshot(session, ts=datetime(2026, 4, 20, 12, 0),
+                                 names={"111110": "호재전자"}, candidate_min_score=60)
+    assert [(c.symbol, c.name) for c in snap.top_candidates] == [("111110", "호재전자")]

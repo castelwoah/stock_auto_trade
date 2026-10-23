@@ -18,6 +18,8 @@ from email.utils import parsedate_to_datetime
 from typing import Iterator
 from xml.etree import ElementTree as ET
 
+from src.common.clock import KST
+
 from ..base_scraper import Article, BaseScraper
 
 
@@ -30,9 +32,8 @@ DEFAULT_FEED_URLS: list[str] = [
     "https://www.yna.co.kr/rss/economy.xml",
     "https://www.yna.co.kr/rss/market.xml",
     "https://www.yna.co.kr/rss/industry.xml",
-    "https://www.yna.co.kr/rss/finance.xml",
-    "https://www.yna.co.kr/rss/stock.xml",
 ]
+# finance.xml · stock.xml 은 404 (2026-10-23 확인) → 제외
 
 
 _HTML_TAG_RE = re.compile(r"<[^>]+>")
@@ -77,7 +78,9 @@ def _parse_pubdate(raw: str) -> datetime | None:
         return None
     if dt is None:
         return None
-    # 요구사항: tzinfo 제거해 KST naive 로 저장
+    # 요구사항: tzinfo 제거해 KST naive 로 저장 (+0900 이 아닌 피드도 KST 로 환산)
+    if dt.tzinfo is not None:
+        dt = dt.astimezone(KST)
     return dt.replace(tzinfo=None)
 
 

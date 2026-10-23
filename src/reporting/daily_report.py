@@ -79,6 +79,12 @@ def render_text(report: DailyReport) -> str:
     lines.append(f"  - 후보 편입: {d.candidates_count}개 (스코어 70+)")
     lines.append("")
 
+    nu = report.news_universe
+    if nu is not None:
+        lines.append("■ 뉴스 감시 종목")
+        lines.extend(f"  {x}" for x in _news_universe_lines(nu))
+        lines.append("")
+
     # 매매 실행
     t = report.trades
     lines.append("■ 매매 실행")
@@ -210,6 +216,12 @@ def render_embed(report: DailyReport) -> dict[str, Any]:
         ),
         "inline": False,
     })
+    if report.news_universe is not None:
+        fields.append({
+            "name": "■ 뉴스 감시 종목",
+            "value": "\n".join(_news_universe_lines(report.news_universe)),
+            "inline": False,
+        })
     fields.append({
         "name": "■ 매매 실행",
         "value": (
@@ -284,3 +296,14 @@ def send_daily_report(
     if mode == "text":
         return notifier.send(render_text(report), include_timestamp=False)
     return notifier.send_embed(render_embed(report))
+
+
+def _news_universe_lines(nu) -> list[str]:
+    top = ", ".join(f"{c.name or c.symbol} {c.score:.0f}" for c in nu.top) or "없음"
+    both = sorted(set(nu.universe_signals) & set(nu.static_signals))
+    return [
+        f"- 뉴스 점수 산출 {nu.scored_count}종목 / 후보 {nu.candidate_count}종목",
+        f"- 상위: {top}",
+        f"- 돌파 신호(섀도 비교): 감시 종목 {len(nu.universe_signals)} / "
+        f"watchlist {len(nu.static_signals)} (겹침 {len(both)})",
+    ]

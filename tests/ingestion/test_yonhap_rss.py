@@ -219,3 +219,13 @@ def test_multiple_feeds_aggregated():
         articles = list(scraper.fetch())
 
     assert len(articles) == 3
+
+
+def test_pubdate_converted_to_kst_naive():
+    from datetime import datetime as _dt
+
+    from src.ingestion.scrapers.yonhap_rss import DEFAULT_FEED_URLS, _parse_pubdate
+
+    assert _parse_pubdate("Fri, 23 Oct 2026 03:08:41 GMT") == _dt(2026, 10, 23, 12, 8, 41)
+    assert _parse_pubdate("Fri, 23 Oct 2026 12:08:41 +0900") == _dt(2026, 10, 23, 12, 8, 41)
+    assert not any(u.endswith(("finance.xml", "stock.xml")) for u in DEFAULT_FEED_URLS)

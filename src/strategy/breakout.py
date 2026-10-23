@@ -2,7 +2,8 @@
 
 목표가 = 금일 시가 + (전일 고가 − 전일 저가) × K
 K 는 일반적으로 0.5.
-진입: 현재가 > 목표가
+진입: 현재가 > 목표가. 빈 자리보다 돌파 종목이 많으면 뉴스 점수 → 돌파율 순으로 고른다
+      (ctx.extras["news_scores"]). ctx.extras["entry_blocked"] 종목(뉴스 악재)은 제외.
 청산: 장 마감(15:15) 일괄 청산 (당일 청산 전략) — registry 가 스케줄 트리거.
 서브포트폴리오: 전체 현금의 고정 비율(기본 20%) 만 이 전략에 할당 (D2).
 """
@@ -50,9 +51,11 @@ class BreakoutStrategy(Strategy):
             return []
 
         per_position = ctx.cash_available / self.max_positions
-        signals: list[Signal] = []
+        news_scores: dict[str, float] = ctx.extras.get("news_scores") or {}
+        blocked = ctx.extras.get("entry_blocked") or ()
+        triggered: list[tuple[float, float, str, float, float]] = []
         for symbol, cur in ctx.current_prices.items():
-            if symbol in owned:
+            if symbol in owned or symbol in blocked:
                 continue
             ohlc = ctx.prev_day_ohlc.get(symbol)
             if not ohlc:
@@ -64,19 +67,30 @@ class BreakoutStrategy(Strategy):
                 continue
             target = compute_target_price(open_today, prev_high, prev_low, k=self.k)
             if cur > target:
-                sig_id = f"breakout-{symbol}-{ctx.today.isoformat()}"
-                signals.append(
-                    Signal(
-                        action=Action.BUY,
-                        symbol=symbol,
-                        strategy_id=self.strategy_id,
-                        notional=per_position,
-                        reason=f"breakout: {cur:.0f} > target {target:.0f}",
-                        signal_id=sig_id,
-                    )
+                score = news_scores.get(symbol)
+                ratio = (cur - target) / target if target > 0 else 0.0
+                # 뉴스 점수 높은 순 (점수 없는 예비 종목은 뒤) → 돌파율 높은 순 → 코드 순
+                triggered.append((-(score if score is not None else -1.0), -ratio, symbol, cur, target))
+        signals: list[Signal] = []
+        for _, _, symbol, cur, target in sorted(triggered)[:available_slots]:
+            score = news_scores.get(symbol)
+            reason = f"breakout: {cur:.0f} > target {target:.0f}"
+            if score is not None:
+                reason += f" | news {score:.0f}"
+                ids = (ctx.extras.get("news_articles") or {}).get(symbol) or ()
+                if ids:
+                    reason += f" art {','.join(str(i) for i in ids[-3:])}"   # 근거 기사 (D12)
+            signals.append(
+                Signal(
+                    action=Action.BUY,
+                    symbol=symbol,
+                    strategy_id=self.strategy_id,
+                    notional=per_position,
+                    reason=reason,
+                    signal_id=f"breakout-{symbol}-{ctx.today.isoformat()}",
+                    meta={"news_score": score} if score is not None else {},
                 )
-                if len(signals) >= available_slots:
-                    break
+            )
         return signals
 
     # ------------------------------------------------------------------

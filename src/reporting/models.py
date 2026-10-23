@@ -140,6 +140,24 @@ class RiskStatus:
 
 
 @dataclass(frozen=True)
+class NewsCandidate:
+    symbol: str
+    name: str = ""
+    score: float = 0.0
+
+
+@dataclass(frozen=True)
+class NewsUniverseSummary:
+    """news-universe-v1 — 뉴스 후보 + 섀도 비교(universe vs watchlist 돌파 신호)."""
+
+    scored_count: int = 0
+    candidate_count: int = 0
+    top: list[NewsCandidate] = field(default_factory=list)
+    universe_signals: list[str] = field(default_factory=list)
+    static_signals: list[str] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
 class DailyReport:
     report_date: date
     market: MarketSummary = field(default_factory=MarketSummary)
@@ -149,6 +167,7 @@ class DailyReport:
     risk: RiskStatus = field(default_factory=RiskStatus)
     next_actions: list[str] = field(default_factory=list)
     strategy_version: str = "v1.0"
+    news_universe: NewsUniverseSummary | None = None
 
 
 # ---------------------------------------------------------------------------

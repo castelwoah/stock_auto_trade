@@ -26,6 +26,7 @@ from src.clients.kis import KisClient
 from src.common.clock import now_kst, today_kst
 from src.common.redact import RedactingFormatter, register_secrets
 from src.config import get_settings
+from src.ingestion.service import NewsService
 from src.persistence.db import init_db, session_scope
 from src.reporting.archiver import Archiver
 from src.reporting.builders import build_daily_report, build_midday_snapshot
@@ -57,22 +58,39 @@ def _register_secrets(settings) -> None:
     ])
 
 
-def _make_job_handlers(settings, kis, notifier, runtime):
+def _make_job_handlers(settings, kis, notifier, runtime, news):
     """Job bodies.
 
     - prepare_state / trading_tick: TradingRuntime (실구현, Phase A)
     - midday_report / daily_report: DB 기반 리포트 (v3.1)
-    - master_refresh / news_collect / analyze_score: stub (Phase C)
+    - master_refresh / news_collect / analyze_score: NewsService (news-universe-v1)
+      → 수집 후마다 runtime.refresh_universe 로 감시 종목 교체
     모든 핸들러는 예외를 삼키고 알린다 — 한 job 실패가 스케줄러를 멈추지 않게.
     """
     def master_refresh():
-        logging.info("[job] master_refresh (stub) — re-download kospi/kosdaq mst")
+        logging.info("[job] master_refresh — kospi/kosdaq mst (D9)")
+        try:
+            if news.refresh_master(today_kst()) is None:
+                notifier.send("[master_refresh] 종목 마스터 없음 — 뉴스 매칭 중단 (watchlist 로 운용)")
+        except Exception as exc:
+            logging.exception("master_refresh failed")
+            runtime.notify_error("master_refresh", exc)
 
     def news_collect():
-        logging.info("[job] news_collect (stub) — ingestion scrapers")
+        now = now_kst()
+        try:
+            news.collect(now)
+        except Exception:
+            logging.exception("news_collect failed")   # 다음 주기에 재시도 (알림 생략)
+        if settings.UNIVERSE_MODE != "static":
+            runtime.refresh_universe(now)
 
     def analyze_score():
-        logging.info("[job] analyze_score (stub) — compute factor scores")
+        now = now_kst()
+        logging.info("[job] analyze_score — build universe")
+        u = runtime.refresh_universe(now)
+        if u is not None:
+            logging.info("universe ready: %s", u.summary())
 
     def prepare_state():
         logging.info("[job] prepare_state — reconcile KIS↔DB, start equity, daily data")
@@ -97,7 +115,10 @@ def _make_job_handlers(settings, kis, notifier, runtime):
         logging.info("[job] midday_report — 장중 스냅샷 생성 중")
         try:
             with session_scope() as session:
-                snap = build_midday_snapshot(session, ts=now)
+                snap = build_midday_snapshot(
+                    session, ts=now, names=news.names(now.date()),
+                    candidate_min_score=settings.NEWS_MIN_SCORE,
+                )
                 send_midday_report(notifier, snap)
             logging.info("midday snapshot sent (%d positions, %d candidates, %d anomalies)",
                          len(snap.positions), len(snap.top_candidates), len(snap.anomalies))
@@ -111,7 +132,10 @@ def _make_job_handlers(settings, kis, notifier, runtime):
         try:
             archiver = Archiver(settings.ARCHIVE_ROOT)
             with session_scope() as session:
-                report = build_daily_report(session, report_date=today)
+                report = build_daily_report(
+                    session, report_date=today, names=news.names(today),
+                    news_min_score=settings.NEWS_MIN_SCORE,
+                )
                 send_daily_report(notifier, report)
                 archiver.write_daily_report(report)
                 archiver.write_trades_csv(report)
@@ -165,8 +189,9 @@ def main(argv: list[str] | None = None) -> int:
 
     # Scheduler
     sched = TradingScheduler(timezone="Asia/Seoul")
-    runtime = TradingRuntime(settings, kis, notifier)
-    jobs = _make_job_handlers(settings, kis, notifier, runtime)
+    news = NewsService(settings)
+    runtime = TradingRuntime(settings, kis, notifier, universe_builder=news.build_universe)
+    jobs = _make_job_handlers(settings, kis, notifier, runtime, news)
     register_default_jobs(
         sched,
         master_refresh=jobs["master_refresh"],
@@ -176,6 +201,7 @@ def main(argv: list[str] | None = None) -> int:
         trading_tick=jobs["trading_tick"],
         midday_report=jobs["midday_report"],
         daily_report=jobs["daily_report"],
+        news_poll_minutes=settings.NEWS_POLL_MINUTES,
     )
 
     if args.dry_run:

@@ -112,3 +112,24 @@ def test_exit_ignores_other_strategy():
 
 def test_breakout_uses_default_k():
     assert BreakoutStrategy().k == BREAKOUT_K
+
+
+# --- news-universe-v1: 매수 순서 · 악재 차단 · 근거 기록 ---------------------------
+
+def test_slots_filled_by_breakout_ratio_without_news():
+    # A 돌파율 (105-103)/103 ≈ 1.9% > B (210-208)/208 ≈ 1.0%
+    sigs = BreakoutStrategy(max_positions=1).decide_entries(_ctx())
+    assert [s.symbol for s in sigs] == ["A"]
+
+
+def test_news_score_ranks_before_breakout_ratio():
+    ctx = _ctx(extras={"news_scores": {"B": 80.0}, "news_articles": {"B": (11, 12, 13, 14)}})
+    sigs = BreakoutStrategy(max_positions=1).decide_entries(ctx)
+    assert [s.symbol for s in sigs] == ["B"]
+    assert "news 80" in sigs[0].reason and "art 12,13,14" in sigs[0].reason
+    assert sigs[0].meta == {"news_score": 80.0}
+
+
+def test_entry_blocked_symbols_skipped():
+    sigs = BreakoutStrategy().decide_entries(_ctx(extras={"entry_blocked": frozenset({"A"})}))
+    assert {s.symbol for s in sigs} == {"B"}
