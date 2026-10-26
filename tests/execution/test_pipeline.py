@@ -81,12 +81,13 @@ def _risk(**over):
     return RiskEngine(**defaults)
 
 
-def _pipe(session, *, risk=None, kis=None, strategy=None, kill_switch=None):
+def _pipe(session, *, risk=None, kis=None, strategy=None, kill_switch=None, shadow=False):
     kis = kis or _kis()
     lp = LivePortfolio(session)
     reg = StrategyRegistry()
     reg.register(strategy or _StubBuy(), allocation_pct=50)
-    om = OrderManager(kis_client=kis, portfolio=lp, now_provider=lambda: datetime(2026, 4, 20, 10))
+    om = OrderManager(kis_client=kis, portfolio=lp, now_provider=lambda: datetime(2026, 4, 20, 10),
+                      shadow=shadow)
     rec = Reconciler(session, kis)
     return TradingPipeline(
         registry=reg, risk_engine=risk or _risk(),
@@ -334,3 +335,78 @@ def test_block_entries_reason_blocks_buys_only(session):
     pipe2 = _pipe(session, kis=kis, strategy=_StubSell())
     executed = pipe2.run_tick(_replace(_tick(), block_entries_reason="잔고 조회 실패"))
     assert [s.action for s in executed] == [Action.SELL]
+
+
+# --- 섀도 가상 자본: 섀도 매수 누적 + 수량 0 기록 (2026-10-26) ---------------
+
+class _TwoBuysShadow(Strategy):
+    strategy_id = "test_buy"
+
+    def decide_entries(self, ctx):
+        return [Signal(action=Action.BUY, symbol=s, strategy_id=self.strategy_id,
+                       notional=200_000, signal_id=f"s-{s}") for s in ("A", "B")]
+
+    def decide_exits(self, ctx):
+        return []
+
+
+def _seed_shadow_buy(session, *, symbol="A", qty=300, price=1000.0, ts=datetime(2026, 4, 20, 9, 30)):
+    from src.persistence.models import Trade
+
+    session.add(Trade(ts=ts, symbol=symbol, side="BUY", qty=qty, price=price, strategy_id="test_buy",
+                      idempotency_key=f"seed-{symbol}-{ts:%H%M}", status="shadow"))
+    session.flush()
+
+
+def test_shadow_buys_count_toward_cap(session):
+    """섀도 매수는 송신하지 않아도 투입액 — 두 번째 매수는 상한 잔여분만."""
+    from src.persistence.models import Trade
+
+    kis = _kis()
+    pipe = _pipe(session, kis=kis, risk=_risk(capital_cap_krw=300_000),
+                 strategy=_TwoBuysShadow(), shadow=True)
+    liq = {"A": LIQ["A"], "B": LIQ["A"]}
+    pipe.run_tick(_tick(current_prices={"A": 1000, "B": 1000}, liquidity=liq))
+    assert kis.order.call_count == 0
+    rows = session.query(Trade).order_by(Trade.id).all()
+    assert [(t.symbol, t.qty, t.status) for t in rows] == [("A", 200, "shadow"), ("B", 100, "shadow")]
+
+
+def test_shadow_buy_from_db_exhausts_cap(session):
+    """재시작 후에도 당일 섀도 매수(DB)가 상한에 반영된다."""
+    from src.persistence.models import RiskEvent
+
+    _seed_shadow_buy(session, symbol="B", qty=300)
+    pipe = _pipe(session, risk=_risk(capital_cap_krw=300_000), shadow=True)
+    assert pipe.run_tick(_tick()) == []
+    ev = session.query(RiskEvent).filter_by(event_type="risk_blocked").one()
+    assert ev.action_taken == "capital_cap"
+
+
+def test_shadow_buy_of_other_day_ignored(session):
+    _seed_shadow_buy(session, symbol="B", qty=300, ts=datetime(2026, 4, 17, 10))
+    pipe = _pipe(session, risk=_risk(capital_cap_krw=300_000), shadow=True)
+    assert len(pipe.run_tick(_tick())) == 1
+
+
+def test_live_mode_ignores_shadow_rows(session):
+    _seed_shadow_buy(session, symbol="B", qty=300)
+    kis = _kis()
+    pipe = _pipe(session, kis=kis, risk=_risk(capital_cap_krw=300_000))
+    assert len(pipe.run_tick(_tick())) == 1
+    assert kis.order.call_count == 1
+
+
+def test_qty_zero_buy_recorded(session, caplog):
+    """금액이 1주 가격보다 작으면 버리지 않고 risk_blocked(qty_zero) 로 남긴다."""
+    from src.persistence.models import RiskEvent
+
+    caplog.set_level("INFO")
+    kis = _kis()
+    pipe = _pipe(session, kis=kis, risk=_risk(capital_cap_krw=500))
+    assert pipe.run_tick(_tick()) == []
+    assert kis.order.call_count == 0
+    ev = session.query(RiskEvent).filter_by(event_type="risk_blocked").one()
+    assert ev.action_taken == "qty_zero" and ev.symbol == "A"
+    assert "500" in ev.detail and "1,000" in ev.detail
+    assert "qty 0" in caplog.text

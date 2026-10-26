@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field, replace
-from datetime import date, datetime
+from datetime import date, datetime, time
 from typing import Callable
 
 from datetime import datetime as _dt
@@ -210,6 +210,13 @@ class TradingPipeline:
         # 미체결 매수 주문도 투입액으로 본다 (상한·종목 20% 계산이 체결 전에 새지 않도록)
         for sym, amount in self.orders.pending_buy_notional().items():
             existing[sym] = existing.get(sym, 0.0) + amount
+        # 섀도 모드: 송신하지 않은 당일 매수도 투입액으로 본다 (상한이 실전처럼 소진되도록)
+        if self.orders.shadow is True:
+            d = ctx.as_of.date()
+            for sym, amount in self.portfolio.shadow_buy_notional(
+                datetime.combine(d, time.min), datetime.combine(d, time(23, 59, 59)),
+            ).items():
+                existing[sym] = existing.get(sym, 0.0) + amount
         portfolio_value = ctx.portfolio_value if ctx.portfolio_value is not None else self.portfolio.equity(ctx.cash_available, ctx.current_prices)
         market_cap, avg_value = ctx.liquidity.get(sig.symbol, (None, None))
         return BuyContext(
@@ -230,6 +237,11 @@ class TradingPipeline:
         if sig.action == Action.BUY:
             qty = resolve_quantity(max_notional=sig.notional, price=price)
             if qty <= 0:
+                # 금액이 1주 가격보다 작음 — 리포트 "실패·차단" 에 집계되도록 기록
+                logger.info("skip BUY %s: notional %.0f < price %.0f (qty 0)",
+                            sig.symbol, sig.notional, price)
+                self._record_risk_block(sig, RiskBlocked(
+                    "qty_zero", f"금액 {sig.notional:,.0f} < 가격 {price:,.0f}"), ctx.as_of)
                 return False
         else:  # SELL
             qty = sig.qty

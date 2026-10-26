@@ -89,6 +89,9 @@ class Settings(BaseSettings):
     KILL_SWITCH_FILE: Path = Field(default_factory=lambda: PROJECT_ROOT / "run" / "TRADING_DISABLED")
     # 섀도 모드: 전 파이프라인 + risk_gate 를 돌리되 KIS 주문 송신만 생략 (기본 ON — 해제는 명시적으로)
     SHADOW_MODE: bool = True
+    # 섀도 모드 전용 가상 자본(원). 매수 금액·투입 상한·일일 손실 기준을 실계좌 대신 이 값으로 계산
+    # (실계좌 조회는 계속). SHADOW_MODE=False 이면 무시. None = 실계좌 값 사용
+    SHADOW_CAPITAL_KRW: float | None = Field(default=None, gt=0.0)
     # 전략별 현금 배분 % (합 ≤ 100). news_swing 은 실데이터 검증 전까지 0
     ALLOC_BREAKOUT_PCT: float = Field(default=20.0, ge=0.0, le=100.0)
     ALLOC_NEWS_SWING_PCT: float = Field(default=0.0, ge=0.0, le=100.0)
@@ -113,6 +116,10 @@ class Settings(BaseSettings):
 
     def kill_switch_on(self) -> bool:
         return self.TRADING_DISABLED or self.KILL_SWITCH_FILE.exists()
+
+    def shadow_capital(self) -> float | None:
+        """섀도 모드일 때만 가상 자본 — 실주문 모드에서는 항상 None (실계좌 기준)."""
+        return self.SHADOW_CAPITAL_KRW if self.SHADOW_MODE else None
 
     model_config = SettingsConfigDict(
         env_file=str(PROJECT_ROOT / ".env"),

@@ -82,3 +82,11 @@ def test_kill_switch_flag_and_file(tmp_path):
     flag.touch()
     assert s.kill_switch_on() is True
     assert make_settings(TRADING_DISABLED=True, KILL_SWITCH_FILE=tmp_path / "x").kill_switch_on()
+
+
+def test_shadow_capital_only_in_shadow_mode():
+    assert make_settings().shadow_capital() is None
+    assert make_settings(SHADOW_CAPITAL_KRW=10_000_000).shadow_capital() == 10_000_000
+    assert make_settings(SHADOW_MODE=False, SHADOW_CAPITAL_KRW=10_000_000).shadow_capital() is None
+    with pytest.raises(ValidationError):
+        make_settings(SHADOW_CAPITAL_KRW=0)

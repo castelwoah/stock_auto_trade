@@ -164,6 +164,20 @@ class LivePortfolio:
             ).order_by(Trade.ts)
         ).scalars().all())
 
+    def shadow_buy_notional(self, day_start: datetime, day_end: datetime) -> dict[str, float]:
+        """섀도 모드 투입액: 해당 일자 shadow BUY 기록의 symbol 별 qty × price."""
+        out: dict[str, float] = {}
+        for sym, qty, price in self.session.execute(
+            select(Trade.symbol, Trade.qty, Trade.price).where(
+                Trade.ts >= day_start,
+                Trade.ts <= day_end,
+                Trade.side == "BUY",
+                Trade.status == "shadow",
+            )
+        ).all():
+            out[sym] = out.get(sym, 0.0) + qty * price
+        return out
+
     def executed_signal_ids(self, day_start: datetime, day_end: datetime) -> list[str]:
         """registry 복원용: 해당 일자에 실제 송신(또는 시도)된 signal_id. shadow 제외."""
         rows = self.session.execute(

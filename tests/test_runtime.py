@@ -133,6 +133,62 @@ def test_shadow_tick_records_but_never_sends(factory, tmp_path):
     assert [t.status for t in _trades(factory)] == ["shadow"]
 
 
+def test_shadow_capital_replaces_small_account(factory, tmp_path):
+    """섀도 가상 자본: 실평가액 4.8만이어도 상한·매수 금액은 1,000만 기준."""
+    kis = FakeKis()
+    kis.equity, kis.cash = 48_000.0, 40_875
+    rt, clock = _rt(factory, kis, tmp_path=tmp_path, SHADOW_CAPITAL_KRW=10_000_000)
+    rt.prepare()
+    assert rt.pipeline.risk.capital_cap_krw == 500_000
+    msg = rt.notifier.sent[-1]
+    assert "시작 평가액(가상) 10,000,000원" in msg and "실평가액 48,000원" in msg
+    clock[0] = datetime(2026, 10, 20, 9, 10)
+    assert rt.tick() == 1
+    assert kis.orders == []
+    (t,) = _trades(factory)
+    assert t.status == "shadow" and t.qty == 6                   # 500,000 / 72,000
+
+
+def test_shadow_capital_cash_reduced_by_shadow_buys_after_restart(factory, tmp_path):
+    kis = FakeKis()
+    kis.equity, kis.cash = 48_000.0, 40_875
+    rt, clock = _rt(factory, kis, tmp_path=tmp_path, SHADOW_CAPITAL_KRW=10_000_000)
+    rt.prepare()
+    clock[0] = datetime(2026, 10, 20, 9, 10)
+    rt.tick()
+    rt2, _ = _rt(factory, kis, clock=clock, tmp_path=tmp_path, SHADOW_CAPITAL_KRW=10_000_000)
+    rt2.prepare()
+    cash, equity = rt2._virtual_account(10_000_000, clock[0].date())
+    assert (cash, equity) == (10_000_000 - 6 * 72_000, 10_000_000)
+
+
+def test_small_account_without_shadow_capital_records_qty_zero(factory, tmp_path):
+    kis = FakeKis()
+    kis.equity, kis.cash = 48_000.0, 40_875
+    rt, clock = _rt(factory, kis, tmp_path=tmp_path)
+    rt.prepare()
+    clock[0] = datetime(2026, 10, 20, 9, 10)
+    assert rt.tick() == 0
+    assert _trades(factory) == []
+    with factory() as s:
+        ev = s.query(RiskEvent).filter_by(event_type="risk_blocked").one()
+    assert ev.action_taken == "qty_zero"
+
+
+def test_shadow_capital_ignored_in_live_mode(factory, tmp_path):
+    kis = FakeKis()
+    kis.equity, kis.cash = 48_000.0, 40_875
+    rt, clock = _rt(factory, kis, tmp_path=tmp_path, SHADOW_MODE=False,
+                    SHADOW_CAPITAL_KRW=10_000_000)
+    rt.prepare()
+    assert rt.pipeline.risk.capital_cap_krw == 48_000 * 0.05
+    msg = rt.notifier.sent[-1]
+    assert "SHADOW_CAPITAL_KRW 무시됨" in msg and "(가상)" not in msg
+    clock[0] = datetime(2026, 10, 20, 9, 10)
+    assert rt.tick() == 0
+    assert kis.orders == []
+
+
 def test_live_tick_sends_within_capital_cap(factory, tmp_path):
     kis = FakeKis()
     rt, clock = _rt(factory, kis, tmp_path=tmp_path, SHADOW_MODE=False)

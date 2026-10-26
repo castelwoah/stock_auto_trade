@@ -3,6 +3,7 @@
 하루 단위 상태를 소유한다:
   - DB 세션 1개 (tick 마다 commit, 일과 종료 시 close)
   - RiskEngine (start_equity = 09:00 평가액 고정 — D7, 투입 상한 = start × MAX_DEPLOY_PCT)
+    섀도 모드 + SHADOW_CAPITAL_KRW 이면 평가액·현금은 가상 자본 기준 (실계좌 조회는 계속)
   - StrategyRegistry (당일 실행 signal_id 를 DB 에서 복원 — 재시작 중복 차단)
   - OrderManager (당일 미종결 주문을 DB 에서 복원)
   - 시장 데이터: 전일 OHLC·20일 평균 거래대금(09:00), 시세·종목 상태(매 tick)
@@ -139,8 +140,10 @@ class TradingRuntime:
         reconciler = Reconciler(self.session, self.kis, **reconciler_kw)
         recon = reconciler.verify_with_grace()
 
-        start_equity = self._read_equity()
-        self._last_equity = start_equity
+        real_equity = self._read_equity()
+        self._last_equity = real_equity
+        virtual = self.settings.shadow_capital()
+        start_equity = virtual if virtual is not None else real_equity
         cap = start_equity * self.settings.MAX_DEPLOY_PCT / 100.0
         risk = RiskEngine(
             blacklist=StaticBlacklist(),
@@ -179,13 +182,19 @@ class TradingRuntime:
         self.prepared_for = now.date()
 
         mode = "SHADOW(주문 미송신)" if self.settings.SHADOW_MODE else "LIVE(실주문)"
+        equity_line = f"시작 평가액 {start_equity:,.0f}원 · 투입 상한 {cap:,.0f}원 ({self.settings.MAX_DEPLOY_PCT}%)"
+        if virtual is not None:
+            equity_line = (f"시작 평가액(가상) {start_equity:,.0f}원 · 투입 상한 {cap:,.0f}원 "
+                           f"({self.settings.MAX_DEPLOY_PCT}%) · 실평가액 {real_equity:,.0f}원")
         lines = [
             f"[prepare] {now:%Y-%m-%d %H:%M} {self.settings.KIS_ENV.value} / {mode}",
-            f"시작 평가액 {start_equity:,.0f}원 · 투입 상한 {cap:,.0f}원 ({self.settings.MAX_DEPLOY_PCT}%)",
+            equity_line,
             f"전략: {', '.join(s.strategy_id for s in registry.strategies()) or '없음'} · 감시 {len(self.active_symbols())}종목 · 복원 주문 {restored}건",
             f"감시 종목: {self._universe_label()}",
             f"Reconcile: {'OK' if recon.ok else 'MISMATCH → 매매 OFF: ' + recon.detail}",
         ]
+        if not self.settings.SHADOW_MODE and self.settings.SHADOW_CAPITAL_KRW is not None:
+            lines.append("⚠️ SHADOW_CAPITAL_KRW 무시됨 — 실주문 모드는 실계좌 기준")
         if late:
             lines.append("⚠️ 09:05 이후 준비 — 시작 평가액이 D7 기준(09:00)과 다를 수 있음")
         if self.settings.kill_switch_on():
@@ -220,6 +229,9 @@ class TradingRuntime:
         tradable = {s: q for s, q in quotes.items() if s in active or s in held}
 
         cash, equity, stale = self._read_account()
+        virtual = self.settings.shadow_capital()
+        if virtual is not None:
+            cash, equity = self._virtual_account(virtual, now.date())
         ctx = TickContext(
             as_of=now,
             cash_available=cash,
@@ -358,6 +370,14 @@ class TradingRuntime:
             stale.append("평가액")
         reason = f"잔고 조회 실패({'·'.join(stale)}) — 직전값 사용" if stale else None
         return self._last_cash, self._last_equity, reason
+
+    def _virtual_account(self, capital: float, day: date) -> tuple[float, float]:
+        """섀도 가상 자본: (현금 = 자본 − 당일 섀도 매수액, 평가액 = 자본)."""
+        assert self.pipeline is not None
+        spent = sum(self.pipeline.portfolio.shadow_buy_notional(
+            datetime.combine(day, time.min), datetime.combine(day, time(23, 59, 59)),
+        ).values())
+        return max(capital - spent, 0.0), capital
 
     def _read_equity(self) -> float:
         _, evaluation = self.kis.get_stock_balance()
