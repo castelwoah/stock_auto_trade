@@ -382,8 +382,9 @@ class KisClient:
             liquidation=out.get("sltr_yn") == "Y",
         )
 
-    def get_index_change_pct(self, index_code: str = "0001") -> float:
-        """업종지수 전일 대비율 % (0001 KOSPI / 1001 KOSDAQ). KOSPI −3% 게이트 입력."""
+    def get_index(self, index_code: str = "0001") -> tuple[float | None, float]:
+        """업종지수 (현재 지수, 전일 대비율 %) — 0001 KOSPI / 1001 KOSDAQ.
+        지수 값(bstp_nmix_prpr)이 없거나 읽을 수 없으면 None (등락률만 사용)."""
         data = self._get(
             "uapi/domestic-stock/v1/quotations/inquire-index-price",
             tr_id="FHPUP02100000",
@@ -391,7 +392,16 @@ class KisClient:
         )
         if data.get("rt_cd") != "0":
             raise RuntimeError(f"index fetch failed: {data.get('msg1')}")
-        return float(data["output"]["bstp_nmix_prdy_ctrt"])
+        out = data["output"]
+        try:
+            level = float(out.get("bstp_nmix_prpr")) or None
+        except (TypeError, ValueError):
+            level = None
+        return level, float(out["bstp_nmix_prdy_ctrt"])
+
+    def get_index_change_pct(self, index_code: str = "0001") -> float:
+        """업종지수 전일 대비율 % (0001 KOSPI / 1001 KOSDAQ). KOSPI −3% 게이트 입력."""
+        return self.get_index(index_code)[1]
 
     def get_cash_balance(self, ref_code: str = "005930", ref_price: str = "65500") -> int:
         data = self._get(

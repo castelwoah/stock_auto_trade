@@ -52,8 +52,8 @@ class FakeKis:
             raise RuntimeError("no quote")
         return self.quotes[sym]
 
-    def get_index_change_pct(self, code="0001"):
-        return self.kospi
+    def get_index(self, code="0001"):
+        return (5_500.0 if code == "0001" else 1_100.0), self.kospi
 
     def order(self, *, code, qty, side, ord_dvsn, unit_price):
         odno = f"ORD{len(self.orders) + 1}"
@@ -189,6 +189,67 @@ def test_shadow_capital_ignored_in_live_mode(factory, tmp_path):
     assert kis.orders == []
 
 
+def test_report_state_none_before_prepare(factory, tmp_path):
+    rt, _ = _rt(factory, tmp_path=tmp_path)
+    assert rt.report_state() is None
+
+
+def test_report_state_reflects_tick_values_shadow_virtual(factory, tmp_path):
+    kis = FakeKis()
+    kis.equity, kis.cash, kis.kospi = 48_000.0, 40_875, -2.4
+    rt, clock = _rt(factory, kis, tmp_path=tmp_path, SHADOW_CAPITAL_KRW=10_000_000)
+    rt.prepare()
+    clock[0] = datetime(2026, 10, 20, 9, 10)
+    rt.tick()
+    st = rt.report_state()
+    assert st.market.kospi == 5_500.0 and st.market.kospi_change_pct == -2.4
+    assert st.market.kosdaq == 1_100.0
+    assert st.portfolio.total_value == 10_000_000 and st.portfolio.virtual is True
+    assert st.portfolio.cumulative_return_pct is None and st.portfolio.mdd_pct is None
+    assert st.cash == 10_000_000 - 6 * 72_000
+    assert st.prices[SYM] == 72_000
+    assert st.risk.daily_loss_usage_pct == 0 and st.risk.circuit_breaker_active is False
+
+
+def test_report_state_live_daily_loss_and_cb(factory, tmp_path):
+    kis = FakeKis()
+    rt, clock = _rt(factory, kis, tmp_path=tmp_path, SHADOW_MODE=False)
+    rt.prepare()
+    kis.equity = 9_850_000.0                       # −1.5% → 한도 3% 의 50%
+    kis.quotes = {}
+    clock[0] = datetime(2026, 10, 20, 9, 10)
+    rt.tick()
+    rt.pipeline.risk.circuit_breaker.triggered = True
+    rt.pipeline.risk.circuit_breaker.reason = "3 loss days"
+    st = rt.report_state()
+    assert st.portfolio.virtual is False and st.portfolio.total_value == 9_850_000
+    assert st.portfolio.daily_pnl_krw == -150_000
+    assert st.portfolio.daily_pnl_pct == pytest.approx(-1.5)
+    assert st.risk.daily_loss_usage_pct == pytest.approx(50.0)
+    assert st.risk.circuit_breaker_active and st.risk.circuit_breaker_reason == "3 loss days"
+
+
+def test_report_state_refresh_index_failure_keeps_last(factory, tmp_path):
+    kis = FakeKis()
+    rt, clock = _rt(factory, kis, tmp_path=tmp_path)
+    rt.prepare()
+    clock[0] = datetime(2026, 10, 20, 9, 10)
+    rt.tick()
+    kis.kospi = 1.1
+    assert rt.report_state(refresh_index=True).market.kospi_change_pct == 1.1
+
+    def boom(code):
+        raise RuntimeError("down")
+    kis.get_index = boom
+    assert rt.report_state(refresh_index=True).market.kospi_change_pct == 1.1
+
+
+def test_symbol_name_from_watchlist(factory, tmp_path):
+    rt, _ = _rt(factory, tmp_path=tmp_path)
+    assert rt.symbol_name("005930") == "삼성전자"
+    assert rt.symbol_name("999999") == ""
+
+
 def test_live_tick_sends_within_capital_cap(factory, tmp_path):
     kis = FakeKis()
     rt, clock = _rt(factory, kis, tmp_path=tmp_path, SHADOW_MODE=False)
@@ -267,7 +328,7 @@ def test_index_failure_does_not_block(factory, tmp_path):
     def boom(code="0001"):
         raise RuntimeError("index down")
 
-    kis.get_index_change_pct = boom
+    kis.get_index = boom
     rt, clock = _rt(factory, kis, tmp_path=tmp_path, SHADOW_MODE=False)
     rt.prepare()
     clock[0] = datetime(2026, 10, 20, 9, 10)

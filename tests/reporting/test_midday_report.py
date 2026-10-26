@@ -222,3 +222,11 @@ def test_send_midday_report_text_mode():
     send_midday_report(n, _snap(), mode="text")
     n.send.assert_called_once()
     n.send_embed.assert_not_called()
+
+
+def test_virtual_equity_tag():
+    s = _snap(total_equity=10_000_000, equity_virtual=True)
+    assert "평가액: ₩10,000,000 (가상)" in render_midday_text(s)
+    total = next(f for f in render_midday_embed(s)["fields"] if f["name"] == "■ 종합")
+    assert "(가상)" in total["value"]
+    assert "(가상)" not in render_midday_text(_snap())

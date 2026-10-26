@@ -38,6 +38,10 @@ def _fmt_price(v: float | None) -> str:
     return f"{v:,.1f}"
 
 
+def _virtual_tag(virtual: bool) -> str:
+    return " (가상)" if virtual else ""
+
+
 def _fmt_trade_entry(t: TradeEntry, *, with_pnl: bool) -> str:
     base = f"  - {t.name or '?'} ({t.symbol})"
     if with_pnl and t.pnl_pct is not None:
@@ -76,7 +80,7 @@ def render_text(report: DailyReport) -> str:
     lines.append("■ 데이터 수집")
     lines.append(f"  - 수집 뉴스: {d.news_count}건{dist}")
     lines.append(f"  - 분석 종목: {d.analyzed_count}개")
-    lines.append(f"  - 후보 편입: {d.candidates_count}개 (스코어 70+)")
+    lines.append(f"  - 후보 편입: {d.candidates_count}개 (스코어 {d.candidate_min_score:.0f}+)")
     lines.append("")
 
     nu = report.news_universe
@@ -102,7 +106,7 @@ def render_text(report: DailyReport) -> str:
     # 포트폴리오 현황
     p = report.portfolio
     lines.append("■ 포트폴리오 현황")
-    lines.append(f"  - 평가액: {_fmt_krw(p.total_value).lstrip('+')}")
+    lines.append(f"  - 평가액: {_fmt_krw(p.total_value).lstrip('+')}{_virtual_tag(p.virtual)}")
     lines.append(
         f"  - 당일 손익: {_fmt_pct(p.daily_pnl_pct)} ({_fmt_krw(p.daily_pnl_krw)})"
     )
@@ -234,7 +238,7 @@ def render_embed(report: DailyReport) -> dict[str, Any]:
     fields.append({
         "name": "■ 포트폴리오",
         "value": (
-            f"평가액: {_fmt_krw(p.total_value).lstrip('+')}\n"
+            f"평가액: {_fmt_krw(p.total_value).lstrip('+')}{_virtual_tag(p.virtual)}\n"
             f"당일: {_fmt_pct(p.daily_pnl_pct)} ({_fmt_krw(p.daily_pnl_krw)})\n"
             f"누적: {_fmt_pct(p.cumulative_return_pct)} | MDD: {_fmt_pct(p.mdd_pct, sign=False)}"
         ),

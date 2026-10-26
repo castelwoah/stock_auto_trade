@@ -171,14 +171,24 @@ def test_daily_report_counts_news_and_scores(session):
             url=f"https://x/{i}", url_hash=f"h{i}",
             title="t", body_text="b",
             published_at=datetime(2026, 4, 20, 9, i),
+            retrieved_at=datetime(2026, 4, 20, 9, i, 30),
         ))
+    # 전일 발행 · 당일 수집 → 당일 수집 건수에 포함 (매체 분포와 같은 기준)
+    session.add(NewsArticle(
+        source="yonhap_rss", external_id="old", url="https://x/old", url_hash="hold",
+        title="t", body_text="b", published_at=datetime(2026, 4, 17, 16),
+        retrieved_at=datetime(2026, 4, 20, 8),
+    ))
     _add_score(session, symbol="X", total_score=75)
-    _add_score(session, symbol="Y", total_score=65)   # 후보 아님
+    _add_score(session, symbol="Y", total_score=65)
     session.commit()
     r = build_daily_report(session, report_date=date(2026, 4, 20))
-    assert r.data.news_count == 3
+    assert r.data.news_count == 4
+    assert r.data.news_count == sum(r.data.source_distribution.values())
     assert r.data.analyzed_count == 2
-    assert r.data.candidates_count == 1
+    assert r.data.candidates_count == 2                  # 기본 후보 기준 60
+    r70 = build_daily_report(session, report_date=date(2026, 4, 20), news_min_score=70)
+    assert r70.data.candidates_count == 1 and r70.data.candidate_min_score == 70
 
 
 def test_daily_report_injects_external_state(session):

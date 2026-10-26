@@ -32,6 +32,7 @@ class DataCollectionSummary:
     source_distribution: dict[str, int] = field(default_factory=dict)
     analyzed_count: int = 0
     candidates_count: int = 0
+    candidate_min_score: float = 60.0
 
 
 @dataclass(frozen=True)
@@ -127,8 +128,9 @@ class PortfolioState:
     total_value: float = 0.0
     daily_pnl_krw: float = 0.0
     daily_pnl_pct: float = 0.0
-    cumulative_return_pct: float = 0.0
-    mdd_pct: float = 0.0
+    cumulative_return_pct: float | None = None   # None = 미산출 (DailyPnl 기록 전) → "-"
+    mdd_pct: float | None = None
+    virtual: bool = False                        # 섀도 가상 자본 기준 평가액
 
 
 @dataclass(frozen=True)
@@ -238,6 +240,7 @@ class MidDaySnapshot:
     positions: list[PositionSnapshot] = field(default_factory=list)
     top_candidates: list[CandidateSnapshot] = field(default_factory=list)
     total_equity: float = 0.0
+    equity_virtual: bool = False                 # 섀도 가상 자본 기준 평가액
     unrealized_pnl_pct: float = 0.0
     risk: RiskStatus = field(default_factory=RiskStatus)
     anomalies: list[MidDayAnomaly] = field(default_factory=list)

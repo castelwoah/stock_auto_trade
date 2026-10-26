@@ -534,6 +534,8 @@ W8 (모의투자)   → 단일 세션 (관찰·튜닝)
 - **섀도 가상 자본 (사용자 결정: 1,000만 원, 섀도 매수 누적 포함)**: `SHADOW_CAPITAL_KRW` — `SHADOW_MODE=True` 일 때만 시작 평가액·투입 상한·현금(자본 − 당일 섀도 매수액)을 가상 값으로 계산, 실계좌 조회·Reconcile 은 유지. 당일 `status=shadow` BUY 를 투입액에 포함(DB 기반이라 재시작 복원). 실주문 모드에서는 무시 + prepare 경고. 수량 0 매수는 `RiskEvent(risk_blocked, qty_zero)` 로 기록(모드 무관).
 - **제약**: 섀도 매수는 포지션을 만들지 않아 매도 경로(SL/TP/Trailing/EOD)는 섀도로 검증되지 않음 — 가상 포트폴리오는 B2 이후 별도 과제.
 - 테스트 731 → **741 pass**.
+- **리포트 실값 + 체결 알림 (사용자 승인)**: 미드데이·일일 리포트가 기본값(`-`·₩0·0%)만 찍던 문제 — builder 에 런타임 값 미주입. `runtime.report_state()` 신설(마지막 tick 의 지수 수치·등락률, 평가액(섀도 가상이면 "(가상)"), 당일 손익, Daily Loss 사용률, CB), 16:00 은 지수 재조회. 누적·MDD 는 `DailyPnl` 전까지 `-`. KIS `get_index` 가 `bstp_nmix_prpr`(지수) 함께 반환 — 실 API 로 확인. 수집 뉴스 수를 매체 분포와 같은 `retrieved_at` 기준으로, 후보 수·문구를 `NEWS_MIN_SCORE` 로. 체결 Embed 를 `OrderManager._close_trade` 에 연결(주문 1건당 1회, 부분 체결 표기, 매도 손익은 수수료·세금 반영, 섀도 제외, 알림 실패는 주문 처리와 격리), 종목명은 `runtime.symbol_name`.
+- 테스트 741 → **762 pass**.
 
 ## Notes
 

@@ -209,9 +209,10 @@ def build_daily_report(
 
     # 뉴스·스코어 카운트
     start, end = _day_bounds(report_date)
+    # 수집 건수·매체 분포 모두 "당일 새로 받은 기사"(retrieved_at) 기준
     news_count = (
         session.query(sa_func.count(NewsArticle.id))
-        .filter(NewsArticle.published_at >= start, NewsArticle.published_at <= end)
+        .filter(NewsArticle.retrieved_at >= start, NewsArticle.retrieved_at <= end)
         .scalar() or 0
     )
     analyzed_count = (
@@ -223,7 +224,7 @@ def build_daily_report(
         session.query(sa_func.count(StockScore.id))
         .filter(
             StockScore.score_date == report_date,
-            StockScore.total_score >= 70,
+            StockScore.total_score >= news_min_score,
         )
         .scalar() or 0
     )
@@ -240,6 +241,7 @@ def build_daily_report(
         source_distribution=source_distribution or {},
         analyzed_count=int(analyzed_count),
         candidates_count=int(candidates_count),
+        candidate_min_score=news_min_score,
     )
     trade_summary = TradeExecutionSummary(
         buys=buys,
@@ -318,8 +320,14 @@ def build_midday_snapshot(
     cash_available: float = 0.0,
     names: dict[str, str] | None = None,
     candidate_min_score: float = 70.0,
+    equity: float | None = None,
+    equity_virtual: bool = False,
+    next_actions: list[str] | None = None,
 ) -> MidDaySnapshot:
-    """12:00 시점 스냅샷 — 오전(09:10~12:00) 시도 + 현재 포지션 + 오후 후보."""
+    """12:00 시점 스냅샷 — 오전(09:10~12:00) 시도 + 현재 포지션 + 오후 후보.
+
+    equity: 런타임 평가액(섀도 가상 자본 포함). None 이면 cash_available + 포지션 평가액.
+    """
     day = ts.date()
     prices = current_prices or {}
 
@@ -394,7 +402,7 @@ def build_midday_snapshot(
     ]
 
     # 5) equity / unrealized pct
-    total_equity = cash_available + total_position_value
+    total_equity = equity if equity is not None else cash_available + total_position_value
     overall_unrealized_pct = 0.0
     if total_position_cost > 0:
         overall_unrealized_pct = (
@@ -409,10 +417,11 @@ def build_midday_snapshot(
         positions=positions,
         top_candidates=top_candidates,
         total_equity=total_equity,
+        equity_virtual=equity_virtual,
         unrealized_pnl_pct=overall_unrealized_pct,
         risk=risk or RiskStatus(),
         anomalies=[],  # 아래에서 채움
-        next_actions=[],
+        next_actions=list(next_actions or []),
         strategy_version=strategy_version,
     )
 

@@ -293,3 +293,20 @@ def test_truncates_long_rejection_list():
     r = _with_failures(rejections=rejections)
     txt = render_text(r)
     assert "외 1건" in txt
+
+
+# --- 2026-10-26: 가상 자본 표시 · 누적/MDD 미산출 · 후보 기준 -----------------
+
+def test_virtual_equity_and_missing_cumulative_render():
+    r = _full_report(portfolio=PortfolioState(total_value=10_000_000, virtual=True))
+    text = render_text(r)
+    assert "평가액: ₩10,000,000 (가상)" in text
+    assert "누적 수익률: -" in text and "MDD: -" in text
+    port = next(f for f in render_embed(r)["fields"] if f["name"] == "■ 포트폴리오")
+    assert "(가상)" in port["value"] and "누적: - | MDD: -" in port["value"]
+
+
+def test_candidate_threshold_label_follows_setting():
+    r = _full_report(data=DataCollectionSummary(news_count=1, candidates_count=4,
+                                                candidate_min_score=60.0))
+    assert "후보 편입: 4개 (스코어 60+)" in render_text(r)

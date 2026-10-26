@@ -78,3 +78,33 @@ def test_master_refresh_failure_is_isolated(patched):
     jobs = main_mod._make_job_handlers(settings, MagicMock(), MagicMock(), rt, news)
     jobs["master_refresh"]()
     rt.notify_error.assert_called_once()
+
+
+def test_report_state_kwargs():
+    from src.reporting.models import MarketSummary, PortfolioState, RiskStatus
+    from src.runtime import ReportState
+
+    assert main_mod._midday_state_kwargs(None) == {"next_actions": [main_mod.NO_RUNTIME_STATE]}
+    assert main_mod._daily_state_kwargs(None) == {"next_actions": [main_mod.NO_RUNTIME_STATE]}
+    st = ReportState(market=MarketSummary(kospi=1.0), portfolio=PortfolioState(total_value=5.0, virtual=True),
+                     risk=RiskStatus(), cash=3.0, prices={"A": 1.0})
+    mid = main_mod._midday_state_kwargs(st)
+    assert mid["equity"] == 5.0 and mid["equity_virtual"] is True and mid["cash_available"] == 3.0
+    assert mid["current_prices"] == {"A": 1.0} and mid["market"] is st.market
+    assert main_mod._daily_state_kwargs(st) == {"market": st.market, "portfolio": st.portfolio,
+                                                "risk": st.risk}
+
+
+def test_daily_report_uses_runtime_state(patched, monkeypatch):
+    settings, rt = patched
+    rt.report_state.return_value = None
+    built = {}
+
+    def fake_build(session, **kw):
+        built.update(kw)
+        raise RuntimeError("stop")
+    monkeypatch.setattr(main_mod, "build_daily_report", fake_build)
+    jobs = main_mod._make_job_handlers(settings, MagicMock(), MagicMock(), rt, MagicMock())
+    jobs["daily_report"]()
+    rt.report_state.assert_called_once_with(refresh_index=True)
+    assert built["next_actions"] == [main_mod.NO_RUNTIME_STATE]

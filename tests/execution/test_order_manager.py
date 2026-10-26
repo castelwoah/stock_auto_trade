@@ -539,3 +539,98 @@ def test_rejected_buy_is_not_reattempted(session):
     assert om.submit(_sig(), limit_price=70_000, qty=1, idempotency_key="b",
                      buy_context=_ctx()) is None
     assert session.query(Trade).count() == 1
+
+
+# ---------------------------------------------------------------------------
+# 체결 알림 (2026-10-26)
+# ---------------------------------------------------------------------------
+
+class _Notifier:
+    def __init__(self, fail=False):
+        self.embeds: list[dict] = []
+        self.fail = fail
+
+    def send(self, msg, **k):
+        return True
+
+    def send_embed(self, embed):
+        if self.fail:
+            raise RuntimeError("discord down")
+        self.embeds.append(embed)
+        return True
+
+
+def _fills(n):
+    return [e for e in n.embeds if e["title"] in ("🟢 BUY", "🔴 SELL", "🔵 SELL")]
+
+
+def test_full_buy_fill_notifies_once_with_name(session):
+    kis, n = FakeKis(), _Notifier()
+    om, _ = _om(session, kis, notifier=n, name_of=lambda s: "삼성전자")
+    sig = Signal(action=Action.BUY, symbol="005930", strategy_id="breakout", notional=700_000,
+                 signal_id="b1", reason="breakout 70000 > 69500")
+    om.submit(sig, limit_price=70_000, qty=10, idempotency_key="k", buy_context=_ctx())
+    kis.fill("ORD1", 10, 70_000)
+    om.poll(current_prices={})
+    om.poll(current_prices={})
+    (e,) = _fills(n)
+    assert e["title"] == "🟢 BUY"
+    assert "삼성전자 (005930)" in e["description"] and "10주 × ₩70,000" in e["description"]
+    assert "breakout 70000 > 69500" in e["description"] and "`breakout`" in e["description"]
+
+
+def test_partial_fill_before_resubmit_notified_with_ratio(session):
+    kis, n = FakeKis(), _Notifier()
+    om, clock = _om(session, kis, notifier=n)
+    om.submit(_sig(), limit_price=70_000, qty=10, idempotency_key="k", buy_context=_ctx())
+    kis.fill("ORD1", 4, 70_000)
+    clock[0] = _at(10, 4)
+    om.poll(current_prices={"005930": 70_200})
+    (e,) = _fills(n)
+    assert "4주" in e["description"] and "부분 체결 4/10" in e["description"]
+
+
+def test_sell_fill_reports_pnl_after_costs(session):
+    session.add(Position(symbol="005930", strategy_id="news_swing", qty=10, avg_price=70_000,
+                         opened_at=_at(9, 30), highest_price=70_000, updated_at=_at(9, 30)))
+    session.flush()
+    kis, n = FakeKis(), _Notifier()
+    om, _ = _om(session, kis, notifier=n)
+    om.submit(_sig(Action.SELL, qty=10), limit_price=66_500, qty=10, idempotency_key="s")
+    kis.fill("ORD1", 10, 66_500)
+    om.poll(current_prices={})
+    (e,) = _fills(n)
+    cost = 700_000 * 1.0015
+    pnl = 665_000 * (1 - 0.0038) - cost
+    assert e["title"] == "🔴 SELL"
+    assert f"{pnl / cost * 100:+.2f}%" in e["description"]
+    assert f"-₩{abs(pnl):,.0f}" in e["description"]
+    assert session.get(Position, ("005930", "news_swing")).qty == 0
+
+
+def test_no_fill_no_notification(session):
+    kis, n = FakeKis(), _Notifier()
+    om, clock = _om(session, kis, notifier=n)
+    om.submit(_sig(), limit_price=70_000, qty=10, idempotency_key="k", buy_context=_ctx())
+    clock[0] = _at(15, 16)
+    om.poll(current_prices={})                           # EOD 취소, 체결 0
+    assert _fills(n) == []
+
+
+def test_shadow_never_notifies_fill(session):
+    kis, n = FakeKis(), _Notifier()
+    om, _ = _om(session, kis, notifier=n, shadow=True)
+    om.submit(_sig(), limit_price=70_000, qty=10, idempotency_key="k", buy_context=_ctx())
+    om.poll(current_prices={})
+    assert n.embeds == [] and kis.orders == []
+
+
+def test_notifier_failure_does_not_break_fill_processing(session):
+    kis = FakeKis()
+    om, _ = _om(session, kis, notifier=_Notifier(fail=True))
+    om.submit(_sig(), limit_price=70_000, qty=10, idempotency_key="k", buy_context=_ctx())
+    kis.fill("ORD1", 10, 70_000)
+    om.poll(current_prices={})
+    assert session.query(Trade).one().status == "filled"
+    assert session.get(Position, ("005930", "news_swing")).qty == 10
+    assert om.pending == {}

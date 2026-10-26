@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass, field
 from datetime import date, datetime, time, timedelta
 from typing import Callable
 
@@ -41,9 +42,10 @@ from src.risk.blacklist import (
     BlacklistEntry,
     StaticBlacklist,
 )
-from src.risk.limits import CircuitBreakerState, DailyLossState, RiskEngine
+from src.risk.limits import DAILY_LOSS_LIMIT_PCT, CircuitBreakerState, DailyLossState, RiskEngine
 from src.risk.market_state import MarketState
 from src.persistence.models import RiskEvent
+from src.reporting.models import MarketSummary, PortfolioState, RiskStatus
 from src.scheduler.watchlist import build_initial_watchlist, symbols_of
 from src.strategy.breakout import compute_target_price
 from src.strategy.breakout import BreakoutStrategy
@@ -56,9 +58,20 @@ logger = logging.getLogger(__name__)
 
 ERROR_NOTICE_INTERVAL = timedelta(minutes=30)
 COMPARE_EVENT = "shadow_compare"
+KOSPI, KOSDAQ = "0001", "1001"
 COMPARE_CUTOFF = time(15, 0)       # breakout 신규 매수 중단 시각과 동일
 # mrkt_warn_cls_code → 블랙리스트 사유 (01 주의 / 02 경고 / 03 위험 — 코드 의미는 가정)
 _MARKET_WARNING = {"01": CAUTION, "02": WARNING, "03": RISK}
+
+
+@dataclass(frozen=True)
+class ReportState:
+    """리포트(미드데이·일일)에 넘길 런타임 값 — 마지막 tick 기준."""
+    market: MarketSummary
+    portfolio: PortfolioState
+    risk: RiskStatus
+    cash: float
+    prices: dict[str, float] = field(default_factory=dict)
 
 
 def quote_blacklist_entry(q: Quote) -> BlacklistEntry | None:
@@ -110,6 +123,7 @@ class TradingRuntime:
         self._now = now_provider
         # 예비 watchlist (UNIVERSE_MODE=static 이면 이것만 감시)
         self.symbols = symbols if symbols is not None else symbols_of(build_initial_watchlist())
+        self._static_names = {e.symbol: e.name for e in build_initial_watchlist()}
         self._universe_builder = universe_builder
         self.universe: Universe | None = None     # 참조 교체만 하므로 job 스레드 간 공유 안전
         self._compare_seen: set[tuple[str, str]] = set()
@@ -123,6 +137,11 @@ class TradingRuntime:
         # 잔고 조회 실패 시 대체값 (해당 tick 은 매수 차단) — P1
         self._last_cash: float | None = None
         self._last_equity: float | None = None
+        # 리포트용 — 마지막 tick 의 지수·시세·현금·평가액 (섀도 가상 자본이면 가상 값)
+        self._index: dict[str, tuple[float | None, float]] = {}
+        self._report_prices: dict[str, float] = {}
+        self._report_cash: float | None = None
+        self._report_equity: float | None = None
 
     # ------------------------------------------------------------------
     # 09:00
@@ -144,6 +163,8 @@ class TradingRuntime:
         self._last_equity = real_equity
         virtual = self.settings.shadow_capital()
         start_equity = virtual if virtual is not None else real_equity
+        self._report_equity = start_equity
+        self._report_cash = virtual
         cap = start_equity * self.settings.MAX_DEPLOY_PCT / 100.0
         risk = RiskEngine(
             blacklist=StaticBlacklist(),
@@ -161,7 +182,7 @@ class TradingRuntime:
 
         orders = OrderManager(
             kis_client=self.kis, portfolio=portfolio, notifier=self.notifier,
-            now_provider=self._now, shadow=self.settings.SHADOW_MODE,
+            now_provider=self._now, shadow=self.settings.SHADOW_MODE, name_of=self.symbol_name,
         )
         restored = orders.restore_open_orders(portfolio.open_trades(day_start, day_end))
 
@@ -232,6 +253,8 @@ class TradingRuntime:
         virtual = self.settings.shadow_capital()
         if virtual is not None:
             cash, equity = self._virtual_account(virtual, now.date())
+        self._report_cash, self._report_equity = cash, equity
+        self._report_prices = {s: q.price for s, q in quotes.items()}
         ctx = TickContext(
             as_of=now,
             cash_available=cash,
@@ -272,6 +295,15 @@ class TradingRuntime:
             return None
         self.universe = u
         return u
+
+    def symbol_name(self, symbol: str) -> str:
+        """체결 알림용 종목명 — 감시 종목(마스터 이름) → 예비 watchlist → 빈 문자열."""
+        u = self.universe
+        if u is not None:
+            for e in u.entries:
+                if e.symbol == symbol and e.name:
+                    return e.name
+        return self._static_names.get(symbol, "")
 
     def active_symbols(self) -> list[str]:
         u = self._active_universe()
@@ -371,6 +403,51 @@ class TradingRuntime:
         reason = f"잔고 조회 실패({'·'.join(stale)}) — 직전값 사용" if stale else None
         return self._last_cash, self._last_equity, reason
 
+    def _fetch_index(self) -> None:
+        for code in (KOSPI, KOSDAQ):
+            self._index[code] = self.kis.get_index(code)
+
+    # ------------------------------------------------------------------
+    # report
+    # ------------------------------------------------------------------
+    def report_state(self, *, refresh_index: bool = False) -> ReportState | None:
+        """리포트용 런타임 값. prepare 전이면 None (리포트는 기본값 + 안내 줄).
+        refresh_index=True 면 지수를 다시 조회 (16:00 종가) — 실패 시 마지막 값."""
+        if self.pipeline is None or self.prepared_for is None:
+            return None
+        if refresh_index:
+            try:
+                self._fetch_index()
+            except Exception:
+                logger.warning("index refresh for report failed — using last tick values")
+        risk = self.pipeline.risk
+        dl, cb = risk.daily_loss, risk.circuit_breaker
+        kospi = self._index.get(KOSPI, (None, None))
+        kosdaq = self._index.get(KOSDAQ, (None, None))
+        equity = self._report_equity if self._report_equity is not None else dl.current_equity
+        cash = self._report_cash if self._report_cash is not None else (self._last_cash or 0.0)
+        virtual = self.settings.shadow_capital()
+        if virtual is not None and self.prepared_for is not None:
+            cash, equity = self._virtual_account(virtual, self.prepared_for)   # tick 이후 섀도 매수 반영
+        pnl = equity - dl.start_equity
+        return ReportState(
+            market=MarketSummary(kospi=kospi[0], kospi_change_pct=kospi[1],
+                                 kosdaq=kosdaq[0], kosdaq_change_pct=kosdaq[1]),
+            portfolio=PortfolioState(
+                total_value=equity, daily_pnl_krw=pnl,
+                daily_pnl_pct=pnl / dl.start_equity * 100.0 if dl.start_equity > 0 else 0.0,
+                virtual=virtual is not None,
+            ),
+            risk=RiskStatus(
+                daily_loss_usage_pct=max(0.0, -dl.loss_pct) / abs(DAILY_LOSS_LIMIT_PCT) * 100.0,
+                circuit_breaker_active=cb.triggered,
+                circuit_breaker_reason=cb.reason,
+                consecutive_loss_days=cb.consecutive_loss_days,
+            ),
+            cash=cash,
+            prices=dict(self._report_prices),
+        )
+
     def _virtual_account(self, capital: float, day: date) -> tuple[float, float]:
         """섀도 가상 자본: (현금 = 자본 − 당일 섀도 매수액, 평가액 = 자본)."""
         assert self.pipeline is not None
@@ -431,8 +508,9 @@ class TradingRuntime:
         risk = self.pipeline.risk
         ms = build_market_state(quotes)
         try:
-            ms.kospi_change_pct = self.kis.get_index_change_pct("0001")
-            ms.kosdaq_change_pct = self.kis.get_index_change_pct("1001")
+            self._fetch_index()
+            ms.kospi_change_pct = self._index[KOSPI][1]
+            ms.kosdaq_change_pct = self._index[KOSDAQ][1]
         except Exception:
             # 지수 조회 실패는 차단 사유로 삼지 않는다 (market_state.can_trade_today 정책)
             logger.exception("index fetch failed — KOSPI gate inactive this tick")

@@ -220,6 +220,23 @@ def test_get_index_change_pct(live_client, http):
     assert calls[0]["params"]["FID_INPUT_ISCD"] == "0001"
 
 
+def test_get_index_level_and_change(live_client, http):
+    _, queue = http
+    queue.append(FakeResponse({"rt_cd": "0", "output": {
+        "bstp_nmix_prpr": "5567.23", "bstp_nmix_prdy_ctrt": "0.30"}}))
+    assert live_client.get_index("0001") == (5567.23, 0.30)
+
+
+@pytest.mark.parametrize("raw", [None, "", "abc", "0"])
+def test_get_index_level_missing_keeps_change(live_client, http, raw):
+    _, queue = http
+    out = {"bstp_nmix_prdy_ctrt": "-1.5"}
+    if raw is not None:
+        out["bstp_nmix_prpr"] = raw
+    queue.append(FakeResponse({"rt_cd": "0", "output": out}))
+    assert live_client.get_index("1001") == (None, -1.5)
+
+
 def test_get_index_change_pct_error(live_client, http):
     _, queue = http
     queue.append(FakeResponse({"rt_cd": "1", "msg1": "x"}))

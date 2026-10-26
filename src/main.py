@@ -32,7 +32,7 @@ from src.reporting.archiver import Archiver
 from src.reporting.builders import build_daily_report, build_midday_snapshot
 from src.reporting.daily_report import send_daily_report
 from src.reporting.midday_report import in_valid_window, send_midday_report
-from src.runtime import TradingRuntime
+from src.runtime import ReportState, TradingRuntime
 from src.scheduler.app import TradingScheduler, register_default_jobs
 
 
@@ -56,6 +56,23 @@ def _register_secrets(settings) -> None:
         settings.DISCORD_WEBHOOK_URL.get_secret_value(),
         dart,
     ])
+
+
+NO_RUNTIME_STATE = "런타임 상태 없음 — 시장·평가액·리스크는 기본값 (prepare 전 또는 재시작)"
+
+
+def _midday_state_kwargs(st: ReportState | None) -> dict:
+    if st is None:
+        return {"next_actions": [NO_RUNTIME_STATE]}
+    return dict(market=st.market, risk=st.risk, current_prices=st.prices,
+                cash_available=st.cash, equity=st.portfolio.total_value,
+                equity_virtual=st.portfolio.virtual)
+
+
+def _daily_state_kwargs(st: ReportState | None) -> dict:
+    if st is None:
+        return {"next_actions": [NO_RUNTIME_STATE]}
+    return dict(market=st.market, portfolio=st.portfolio, risk=st.risk)
 
 
 def _make_job_handlers(settings, kis, notifier, runtime, news):
@@ -114,10 +131,12 @@ def _make_job_handlers(settings, kis, notifier, runtime, news):
             return
         logging.info("[job] midday_report — 장중 스냅샷 생성 중")
         try:
+            st = runtime.report_state()
             with session_scope() as session:
                 snap = build_midday_snapshot(
                     session, ts=now, names=news.names(now.date()),
                     candidate_min_score=settings.NEWS_MIN_SCORE,
+                    **_midday_state_kwargs(st),
                 )
                 send_midday_report(notifier, snap)
             logging.info("midday snapshot sent (%d positions, %d candidates, %d anomalies)",
@@ -131,10 +150,12 @@ def _make_job_handlers(settings, kis, notifier, runtime, news):
         logging.info("[job] daily_report for %s", today)
         try:
             archiver = Archiver(settings.ARCHIVE_ROOT)
+            st = runtime.report_state(refresh_index=True)
             with session_scope() as session:
                 report = build_daily_report(
                     session, report_date=today, names=news.names(today),
                     news_min_score=settings.NEWS_MIN_SCORE,
+                    **_daily_state_kwargs(st),
                 )
                 send_daily_report(notifier, report)
                 archiver.write_daily_report(report)

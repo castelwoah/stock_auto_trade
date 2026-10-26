@@ -91,6 +91,10 @@ def detect_anomalies(snap: MidDaySnapshot) -> list[MidDayAnomaly]:
 # Render
 # ---------------------------------------------------------------------------
 
+def _virtual_tag(snap: MidDaySnapshot) -> str:
+    return " (가상)" if snap.equity_virtual else ""
+
+
 def _severity_emoji(sev: str) -> str:
     return {"critical": "🔴", "warn": "🟠", "info": "🔵"}.get(sev, "·")
 
@@ -156,7 +160,7 @@ def render_midday_text(snap: MidDaySnapshot) -> str:
 
     # 종합
     lines.append("■ 종합")
-    lines.append(f"  - 평가액: {_fmt_krw(snap.total_equity).lstrip('+')}")
+    lines.append(f"  - 평가액: {_fmt_krw(snap.total_equity).lstrip('+')}{_virtual_tag(snap)}")
     lines.append(f"  - 미실현 손익: {_fmt_pct(snap.unrealized_pnl_pct)}")
     lines.append(f"  - 오전 실현: {_fmt_krw(mo.realized_pnl_krw)}")
     lines.append("")
@@ -248,7 +252,7 @@ def render_midday_embed(snap: MidDaySnapshot) -> dict[str, Any]:
     fields.append({
         "name": "■ 종합",
         "value": (
-            f"평가액: {_fmt_krw(snap.total_equity).lstrip('+')}\n"
+            f"평가액: {_fmt_krw(snap.total_equity).lstrip('+')}{_virtual_tag(snap)}\n"
             f"미실현: {_fmt_pct(snap.unrealized_pnl_pct)}\n"
             f"오전 실현: {_fmt_krw(mo.realized_pnl_krw)}"
         ),

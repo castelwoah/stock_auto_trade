@@ -34,8 +34,10 @@ from src.clients.discord import DiscordNotifier
 from src.clients.kis import KisClient, KisOrderRejected, OrderAck, OrderFill
 from src.execution.krx_tick import round_to_tick, shift_ticks
 from src.execution.portfolio import LivePortfolio, TradeRecord
-from src.persistence.models import Trade
-from src.reporting.intraday import notify_risk_event
+from src.persistence.models import Position, Trade
+from src.reporting.intraday import notify_buy, notify_risk_event, notify_sell
+from src.reporting.models import TradeEntry
+from src.reporting.pnl_calc import FEE_PCT, TAX_PCT
 from src.risk.exceptions import RiskBlocked
 from src.risk.limits import BuyContext, risk_gate
 from src.strategy.base import Action, Signal
@@ -120,6 +122,7 @@ class OrderManager:
         max_retries: int = MAX_RETRIES,
         resubmit_after_seconds: int = RESUBMIT_AFTER_SECONDS,
         shadow: bool = False,
+        name_of: Callable[[str], str] | None = None,
     ) -> None:
         self.kis = kis_client
         self.portfolio = portfolio
@@ -128,6 +131,7 @@ class OrderManager:
         self.max_retries = max_retries
         self.resubmit_after_seconds = resubmit_after_seconds
         self.shadow = shadow
+        self._name_of = name_of
         self.pending: dict[str, PendingOrder] = {}
         self._tracked_odnos: set[str] = set()
         self._shadow_seq = 0
@@ -530,8 +534,40 @@ class OrderManager:
                 trade, status=STATUS_FILLED, qty=po.filled_qty,
                 price=po.avg_fill_price or po.price, note_add=note,
             )
+            self._notify_fill(po)
         else:
             self._set_trade(trade, status=status)
+
+    def _notify_fill(self, po: PendingOrder) -> None:
+        """체결 Embed (주문 1건당 1회). 알림 실패는 주문·DB 처리에 영향 없음."""
+        if self.notifier is None or self.shadow:
+            return
+        sig = po.signal
+        try:
+            qty, px = po.filled_qty, po.avg_fill_price or po.price
+            reason = sig.reason or ""
+            if qty < po.qty:
+                reason = f"{reason} (부분 체결 {qty}/{po.qty})".strip()
+            name = self._name_of(sig.symbol) if self._name_of is not None else ""
+            if sig.action == Action.BUY:
+                notify_buy(self.notifier, TradeEntry(
+                    symbol=sig.symbol, name=name, qty=qty, price=px, reason=reason,
+                ), strategy_id=sig.strategy_id)
+                return
+            # SELL 은 Position.avg_price 를 줄이지 않으므로 체결 후에도 매입 평균가가 남아 있다
+            pos = self.portfolio.session.get(Position, (sig.symbol, sig.strategy_id))
+            pnl_krw = pnl_pct = None
+            if pos is not None and pos.avg_price > 0:
+                cost = pos.avg_price * qty * (1 + FEE_PCT / 100.0)
+                proceeds = px * qty * (1 - (FEE_PCT + TAX_PCT) / 100.0)
+                pnl_krw = proceeds - cost
+                pnl_pct = pnl_krw / cost * 100.0
+            notify_sell(self.notifier, TradeEntry(
+                symbol=sig.symbol, name=name, qty=qty, price=px,
+                pnl_krw=pnl_krw, pnl_pct=pnl_pct, reason=reason,
+            ), strategy_id=sig.strategy_id)
+        except Exception:
+            logger.exception("fill notification failed: %s", sig.symbol)
 
     def _set_trade(
         self,
