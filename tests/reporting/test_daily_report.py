@@ -310,3 +310,22 @@ def test_candidate_threshold_label_follows_setting():
     r = _full_report(data=DataCollectionSummary(news_count=1, candidates_count=4,
                                                 candidate_min_score=60.0))
     assert "후보 편입: 4개 (스코어 60+)" in render_text(r)
+
+
+# --- ■ 운영 (10-27) ---------------------------------------------------------
+
+def test_ops_section_text_and_embed():
+    r = _full_report(runtime_gaps=["07:15~08:32 (1h17m)", "09:35~10:38 (1h03m)"],
+                     briefing_summary="오늘 적중 2/3 · 누적 5/8 (62%)")
+    text = render_text(r)
+    assert "■ 운영" in text
+    assert "  - 실행 중단: 07:15~08:32 (1h17m), 09:35~10:38 (1h03m)" in text
+    assert "  - 뉴스 브리핑: 오늘 적중 2/3 · 누적 5/8 (62%)" in text
+    ops = next(f for f in render_embed(r)["fields"] if f["name"] == "■ 운영")
+    assert "실행 중단: 07:15~08:32" in ops["value"] and "뉴스 브리핑: 오늘 적중 2/3" in ops["value"]
+
+
+def test_ops_section_absent_when_empty():
+    r = _full_report()
+    assert "■ 운영" not in render_text(r)
+    assert all(f["name"] != "■ 운영" for f in render_embed(r)["fields"])

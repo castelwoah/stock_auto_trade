@@ -8,6 +8,8 @@ v4:
   - kill switch: 켜져 있으면 신규 매수만 차단, 청산은 진행
   - 보유 포지션 highest_price 를 매 tick 갱신 (D3 Trailing 영속화)
   - 유동성 게이트는 TickContext.liquidity 실데이터 사용, 없으면 fail-closed
+  - 매수 1건 금액 ≤ min(투입 상한 잔여, 투입 상한 ÷ deploy_slots)
+  - risk_blocked 기록은 (날짜, 종목, 전략, 사유) 당 1회 — 같은 신호가 tick 마다 반복돼도 1건
 """
 from __future__ import annotations
 
@@ -15,6 +17,8 @@ import logging
 from dataclasses import dataclass, field, replace
 from datetime import date, datetime, time
 from typing import Callable
+
+from sqlalchemy import select
 
 from datetime import datetime as _dt
 
@@ -71,6 +75,7 @@ class TradingPipeline:
         reconciler: Reconciler,
         strategy_ver: str = "v1.0",
         kill_switch: KillSwitch | None = None,
+        deploy_slots: int | None = None,
     ) -> None:
         self.registry = registry
         self.risk = risk_engine
@@ -79,6 +84,8 @@ class TradingPipeline:
         self.reconciler = reconciler
         self.strategy_ver = strategy_ver
         self.kill_switch = kill_switch
+        self.deploy_slots = deploy_slots
+        self._blocks_seen: set[tuple[date, str, str, str]] = set()
         self._trading_off = False
         self._trading_off_reason: str | None = None
 
@@ -153,10 +160,16 @@ class TradingPipeline:
         """매수 금액을 투입 상한 잔여분으로 축소. 잔여 0 이면 그대로 두어
         RiskEngine 의 capital_cap 게이트가 차단·기록하게 한다."""
         left = self.risk.capital_headroom(buy_ctx.existing_positions_notional)
-        if left is None or left <= 0 or sig.notional <= left:
+        if left is None or left <= 0:
             return sig, buy_ctx
-        logger.info("clip %s notional %.0f → %.0f (capital cap)", sig.symbol, sig.notional, left)
-        return replace(sig, notional=left), replace(buy_ctx, intended_notional=left)
+        limit = left
+        cap = self.risk.capital_cap_krw
+        if self.deploy_slots and cap:
+            limit = min(limit, cap / self.deploy_slots)
+        if sig.notional <= limit:
+            return sig, buy_ctx
+        logger.info("clip %s notional %.0f → %.0f (capital cap)", sig.symbol, sig.notional, limit)
+        return replace(sig, notional=limit), replace(buy_ctx, intended_notional=limit)
 
     def _kill_switch_on(self) -> bool:
         if self.kill_switch is None:
@@ -181,26 +194,51 @@ class TradingPipeline:
                 return False
             return True
         except RiskBlocked as rb:
-            logger.info("risk blocked %s %s: %s", sig.action.value, sig.symbol, rb)
             # v3: RiskEvent 에 기록 — daily/midday 리포트에서 집계
             # 스키마 재사용 (rules §4.2 준수): event_type='risk_blocked',
             # action_taken 에 세부 code(blacklist / daily_loss_limit / ...) 저장
-            self._record_risk_block(sig, rb, ctx.as_of)
+            first = self._record_risk_block(sig, rb, ctx.as_of)
+            logger.log(logging.INFO if first else logging.DEBUG,
+                       "risk blocked %s %s: %s", sig.action.value, sig.symbol, rb)
             return False
 
-    def _record_risk_block(self, sig: Signal, rb: RiskBlocked, ts) -> None:
+    def _record_risk_block(self, sig: Signal, rb: RiskBlocked, ts) -> bool:
+        """(날짜, 종목, 전략, 사유) 당 1회만 기록. 새로 기록했으면 True.
+
+        같은 신호가 tick 마다 다시 막혀도 리포트 집계가 부풀지 않게 한다.
+        DB 도 확인하므로 재시작 후에도 중복되지 않는다."""
+        ts = ts if isinstance(ts, _dt) else now_kst()
+        key = (ts.date(), sig.symbol, sig.strategy_id, rb.code)
+        if key in self._blocks_seen:
+            return False
+        prefix = f"{sig.action.value} {sig.symbol} @{sig.strategy_id}:"
         try:
+            exists = self.portfolio.session.execute(
+                select(RiskEvent.id).where(
+                    RiskEvent.event_type == "risk_blocked",
+                    RiskEvent.symbol == sig.symbol,
+                    RiskEvent.action_taken == rb.code,
+                    RiskEvent.ts >= datetime.combine(ts.date(), time.min),
+                    RiskEvent.ts <= datetime.combine(ts.date(), time(23, 59, 59)),
+                    RiskEvent.detail.startswith(prefix, autoescape=True),
+                ).limit(1)
+            ).first()
+            self._blocks_seen.add(key)
+            if exists is not None:
+                return False
             event = RiskEvent(
-                ts=ts if isinstance(ts, _dt) else now_kst(),
+                ts=ts,
                 event_type="risk_blocked",
                 symbol=sig.symbol,
-                detail=f"{sig.action.value} {sig.symbol} @{sig.strategy_id}: {rb.detail}",
+                detail=f"{prefix} {rb.detail}",
                 action_taken=rb.code,
             )
             self.portfolio.session.add(event)
             self.portfolio.session.flush()
+            return True
         except Exception:
             logger.exception("failed to record risk_blocked event for %s", sig.symbol)
+            return False
 
     def _build_buy_context(self, sig: Signal, ctx: TickContext) -> BuyContext:
         existing: dict[str, float] = {}
@@ -238,10 +276,11 @@ class TradingPipeline:
             qty = resolve_quantity(max_notional=sig.notional, price=price)
             if qty <= 0:
                 # 금액이 1주 가격보다 작음 — 리포트 "실패·차단" 에 집계되도록 기록
-                logger.info("skip BUY %s: notional %.0f < price %.0f (qty 0)",
-                            sig.symbol, sig.notional, price)
-                self._record_risk_block(sig, RiskBlocked(
+                first = self._record_risk_block(sig, RiskBlocked(
                     "qty_zero", f"금액 {sig.notional:,.0f} < 가격 {price:,.0f}"), ctx.as_of)
+                logger.log(logging.INFO if first else logging.DEBUG,
+                           "skip BUY %s: notional %.0f < price %.0f (qty 0)",
+                           sig.symbol, sig.notional, price)
                 return False
         else:  # SELL
             qty = sig.qty

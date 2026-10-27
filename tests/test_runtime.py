@@ -142,11 +142,12 @@ def test_shadow_capital_replaces_small_account(factory, tmp_path):
     assert rt.pipeline.risk.capital_cap_krw == 500_000
     msg = rt.notifier.sent[-1]
     assert "시작 평가액(가상) 10,000,000원" in msg and "실평가액 48,000원" in msg
+    assert "종목당 ≤166,667원" in msg
     clock[0] = datetime(2026, 10, 20, 9, 10)
     assert rt.tick() == 1
     assert kis.orders == []
     (t,) = _trades(factory)
-    assert t.status == "shadow" and t.qty == 6                   # 500,000 / 72,000
+    assert t.status == "shadow" and t.qty == 2                   # 500,000 ÷ 3슬롯 / 72,000
 
 
 def test_shadow_capital_cash_reduced_by_shadow_buys_after_restart(factory, tmp_path):
@@ -159,7 +160,7 @@ def test_shadow_capital_cash_reduced_by_shadow_buys_after_restart(factory, tmp_p
     rt2, _ = _rt(factory, kis, clock=clock, tmp_path=tmp_path, SHADOW_CAPITAL_KRW=10_000_000)
     rt2.prepare()
     cash, equity = rt2._virtual_account(10_000_000, clock[0].date())
-    assert (cash, equity) == (10_000_000 - 6 * 72_000, 10_000_000)
+    assert (cash, equity) == (10_000_000 - 2 * 72_000, 10_000_000)
 
 
 def test_small_account_without_shadow_capital_records_qty_zero(factory, tmp_path):
@@ -206,7 +207,7 @@ def test_report_state_reflects_tick_values_shadow_virtual(factory, tmp_path):
     assert st.market.kosdaq == 1_100.0
     assert st.portfolio.total_value == 10_000_000 and st.portfolio.virtual is True
     assert st.portfolio.cumulative_return_pct is None and st.portfolio.mdd_pct is None
-    assert st.cash == 10_000_000 - 6 * 72_000
+    assert st.cash == 10_000_000 - 2 * 72_000
     assert st.prices[SYM] == 72_000
     assert st.risk.daily_loss_usage_pct == 0 and st.risk.circuit_breaker_active is False
 
@@ -258,8 +259,8 @@ def test_live_tick_sends_within_capital_cap(factory, tmp_path):
     rt.tick()
     assert len(kis.orders) == 1
     o = kis.orders[0]
-    # 전략 신호 = 1,000만 × 20% / 3 ≈ 666,666 → 상한 500,000 으로 축소 → 6주 × 72,000
-    assert o["qty"] == 6 and o["qty"] * o["price"] <= 500_000
+    # 전략 신호 = 1,000만 × 20% / 3 ≈ 666,666 → 상한 500,000 ÷ 3슬롯 = 166,666 → 2주 × 72,000
+    assert o["qty"] == 2 and o["qty"] * o["price"] <= 500_000 / 3
 
 
 def test_live_tick_quantity_respects_cap(factory, tmp_path):

@@ -81,7 +81,8 @@ def _risk(**over):
     return RiskEngine(**defaults)
 
 
-def _pipe(session, *, risk=None, kis=None, strategy=None, kill_switch=None, shadow=False):
+def _pipe(session, *, risk=None, kis=None, strategy=None, kill_switch=None, shadow=False,
+          deploy_slots=None):
     kis = kis or _kis()
     lp = LivePortfolio(session)
     reg = StrategyRegistry()
@@ -92,6 +93,7 @@ def _pipe(session, *, risk=None, kis=None, strategy=None, kill_switch=None, shad
     return TradingPipeline(
         registry=reg, risk_engine=risk or _risk(),
         order_manager=om, portfolio=lp, reconciler=rec, kill_switch=kill_switch,
+        deploy_slots=deploy_slots,
     )
 
 
@@ -410,3 +412,95 @@ def test_qty_zero_buy_recorded(session, caplog):
     assert ev.action_taken == "qty_zero" and ev.symbol == "A"
     assert "500" in ev.detail and "1,000" in ev.detail
     assert "qty 0" in caplog.text
+
+
+# ---------------------------------------------------------------------------
+# 투입 상한 슬롯 분할 (10-27)
+# ---------------------------------------------------------------------------
+
+class _ThreeBuys(Strategy):
+    strategy_id = "test_buy"
+
+    def decide_entries(self, ctx):
+        return [Signal(action=Action.BUY, symbol=s, strategy_id=self.strategy_id,
+                       notional=666_667, signal_id=f"s-{s}") for s in ("A", "B", "C")]
+
+    def decide_exits(self, ctx):
+        return []
+
+
+LIQ3 = {s: (10**12, 10**10) for s in ("A", "B", "C")}
+
+
+def test_deploy_slots_split_cap_across_symbols(session):
+    """상한 500,000 ÷ 3슬롯 → 종목당 166,666 — 첫 종목이 상한을 다 쓰지 않는다."""
+    kis = _kis()
+    pipe = _pipe(session, kis=kis, risk=_risk(capital_cap_krw=500_000), strategy=_ThreeBuys(),
+                 deploy_slots=3)
+    executed = pipe.run_tick(_tick(current_prices={"A": 97_200, "B": 8_930, "C": 75_100},
+                                   liquidity=LIQ3))
+    assert [s.symbol for s in executed] == ["A", "B", "C"]
+    qtys = [c.kwargs["qty"] for c in kis.order.call_args_list]
+    assert qtys == [1, 18, 2]
+    assert all(s.notional <= 500_000 / 3 + 1e-6 for s in executed)
+
+
+def test_without_deploy_slots_first_symbol_takes_cap(session):
+    """슬롯 미지정(이전 동작): 첫 종목이 상한 잔여 전부를 쓴다."""
+    kis = _kis()
+    pipe = _pipe(session, kis=kis, risk=_risk(capital_cap_krw=500_000), strategy=_ThreeBuys())
+    executed = pipe.run_tick(_tick(current_prices={"A": 97_200, "B": 8_930, "C": 75_100},
+                                   liquidity=LIQ3))
+    assert executed[0].notional == 500_000
+
+
+def test_deploy_slots_limited_by_remaining_headroom(session):
+    _seed_position(session, strategy_id="other", qty=400, avg=1000.0)   # 잔여 100,000
+    kis = _kis()
+    pipe = _pipe(session, kis=kis, risk=_risk(capital_cap_krw=500_000), deploy_slots=3)
+    executed = pipe.run_tick(_tick())
+    assert executed[0].notional == 100_000
+
+
+def test_deploy_slots_ignored_without_cap(session):
+    kis = _kis()
+    pipe = _pipe(session, kis=kis, deploy_slots=3)
+    executed = pipe.run_tick(_tick())
+    assert executed[0].notional == 100_000                  # 전략 금액 그대로
+
+
+# ---------------------------------------------------------------------------
+# risk_blocked 1일 1회 기록 (10-27)
+# ---------------------------------------------------------------------------
+
+def _blocks(session):
+    from src.persistence.models import RiskEvent
+    return session.query(RiskEvent).filter_by(event_type="risk_blocked").all()
+
+
+def test_qty_zero_recorded_once_per_day_across_ticks(session, caplog):
+    caplog.set_level("DEBUG")
+    pipe = _pipe(session, risk=_risk(capital_cap_krw=500))
+    for minute in (10, 15, 20):
+        pipe.run_tick(_tick(as_of=datetime(2026, 4, 20, 10, minute)))
+    assert len(_blocks(session)) == 1
+    infos = [r for r in caplog.records if "qty 0" in r.getMessage() and r.levelname == "INFO"]
+    debugs = [r for r in caplog.records if "qty 0" in r.getMessage() and r.levelname == "DEBUG"]
+    assert len(infos) == 1 and len(debugs) == 2
+
+
+def test_risk_block_dedupe_survives_restart(session):
+    """새 pipeline(재시작)도 DB 를 보고 같은 날 같은 차단을 다시 쓰지 않는다."""
+    _pipe(session, risk=_risk(capital_cap_krw=500)).run_tick(_tick())
+    _pipe(session, risk=_risk(capital_cap_krw=500)).run_tick(_tick(as_of=datetime(2026, 4, 20, 11)))
+    assert len(_blocks(session)) == 1
+
+
+def test_risk_block_new_day_or_new_code_recorded(session):
+    pipe = _pipe(session, risk=_risk(capital_cap_krw=500))
+    pipe.run_tick(_tick())
+    pipe.run_tick(_tick(as_of=datetime(2026, 4, 21, 10)))              # 다음 날
+    risk = _risk(blacklist=StaticBlacklist.from_iterable([BlacklistEntry(symbol="A", reason=MANAGED)]))
+    _pipe(session, risk=risk).run_tick(_tick(as_of=datetime(2026, 4, 21, 10, 5)))   # 다른 사유
+    codes = sorted((e.ts.date().isoformat(), e.action_taken) for e in _blocks(session))
+    assert codes == [("2026-04-20", "qty_zero"), ("2026-04-21", "blacklist"), ("2026-04-21", "qty_zero")]

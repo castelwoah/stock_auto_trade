@@ -2,7 +2,7 @@
 
 - 등록된 비밀값(계좌번호·앱키·시크릿·웹훅 URL)은 값 그대로 치환
 - URL 쿼리스트링은 통째로 제거 (KIS GET 은 CANO 를 쿼리로 보낸다)
-- Discord 웹훅 URL · Bearer 토큰 · 'NNNNNNNN-NN' 형태 계좌번호는 패턴으로 치환
+- Discord 웹훅 URL · Bearer 토큰 · Anthropic 키(sk-ant-) · 'NNNNNNNN-NN' 형태 계좌번호는 패턴으로 치환
 
 비밀값 등록은 기동 시 1회(`register_secrets`). 등록 전에도 패턴 치환은 동작한다.
 """
@@ -22,6 +22,7 @@ _PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
     (re.compile(r"https?://(?:\w+\.)?discord(?:app)?\.com/api/webhooks/\S+"), "<webhook>"),
     (re.compile(r"(https?://[^\s?#'\"<>]+)\?[^\s'\"<>)]*"), r"\1?<query>"),
     (re.compile(r"(?i)(bearer\s+)[A-Za-z0-9._\-]+"), r"\1" + MASK),
+    (re.compile(r"sk-ant-[A-Za-z0-9_\-]+"), MASK),
     (re.compile(r"(?<!\d)\d{8}-\d{2}(?!\d)"), MASK),
 )
 

@@ -190,6 +190,7 @@ class TradingRuntime:
             registry=registry, risk_engine=risk, order_manager=orders,
             portfolio=portfolio, reconciler=reconciler,
             kill_switch=self.settings.kill_switch_on,
+            deploy_slots=self.settings.MAX_DEPLOY_SLOTS,
         )
         if not recon.ok:
             self.pipeline.set_trading_off(True, reason=f"reconcile mismatch: {recon.detail}")
@@ -203,10 +204,12 @@ class TradingRuntime:
         self.prepared_for = now.date()
 
         mode = "SHADOW(주문 미송신)" if self.settings.SHADOW_MODE else "LIVE(실주문)"
-        equity_line = f"시작 평가액 {start_equity:,.0f}원 · 투입 상한 {cap:,.0f}원 ({self.settings.MAX_DEPLOY_PCT}%)"
+        slot = f" · 종목당 ≤{cap / self.settings.MAX_DEPLOY_SLOTS:,.0f}원"
+        equity_line = (f"시작 평가액 {start_equity:,.0f}원 · 투입 상한 {cap:,.0f}원 "
+                       f"({self.settings.MAX_DEPLOY_PCT}%){slot}")
         if virtual is not None:
             equity_line = (f"시작 평가액(가상) {start_equity:,.0f}원 · 투입 상한 {cap:,.0f}원 "
-                           f"({self.settings.MAX_DEPLOY_PCT}%) · 실평가액 {real_equity:,.0f}원")
+                           f"({self.settings.MAX_DEPLOY_PCT}%){slot} · 실평가액 {real_equity:,.0f}원")
         lines = [
             f"[prepare] {now:%Y-%m-%d %H:%M} {self.settings.KIS_ENV.value} / {mode}",
             equity_line,

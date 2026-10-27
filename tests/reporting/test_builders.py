@@ -341,3 +341,26 @@ def test_midday_candidates_use_threshold_and_names(session):
     snap = build_midday_snapshot(session, ts=datetime(2026, 4, 20, 12, 0),
                                  names={"111110": "호재전자"}, candidate_min_score=60)
     assert [(c.symbol, c.name) for c in snap.top_candidates] == [("111110", "호재전자")]
+
+
+def test_daily_report_risk_blocks_deduped_per_symbol_code(session):
+    """10-27 이전처럼 tick 마다 쌓인 같은 차단은 1건으로 센다."""
+    for minute in (10, 15, 20):
+        _add_risk_block(session, ts=datetime(2026, 4, 20, 11, minute), symbol="A",
+                        detail="BUY A @breakout: 금액 5,070 < 가격 21,600", action_taken="qty_zero")
+    _add_risk_block(session, symbol="B", detail="BUY B @breakout: x", action_taken="qty_zero")
+    _add_risk_block(session, symbol="A", detail="BUY A @breakout: y", action_taken="capital_cap")
+    session.commit()
+    r = build_daily_report(session, report_date=date(2026, 4, 20))
+    assert r.trades.risk_block_breakdown == {"qty_zero": 2, "capital_cap": 1}
+    snap = build_midday_snapshot(session, ts=datetime(2026, 4, 20, 12, 0))
+    assert snap.morning.risk_block_breakdown == {"qty_zero": 2, "capital_cap": 1}
+
+
+def test_daily_report_lists_runtime_gaps(session):
+    session.add(RiskEvent(ts=datetime(2026, 4, 20, 8, 32), event_type="runtime_gap",
+                          detail="07:15~08:32 (1h17m)", action_taken="resumed"))
+    session.add(RiskEvent(ts=datetime(2026, 4, 21, 9, 0), event_type="runtime_gap", detail="다른 날"))
+    session.commit()
+    r = build_daily_report(session, report_date=date(2026, 4, 20))
+    assert r.runtime_gaps == ["07:15~08:32 (1h17m)"]

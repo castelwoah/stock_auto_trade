@@ -145,10 +145,19 @@ def render_text(report: DailyReport) -> str:
             parts = [f"{code} {cnt}" for code, cnt in sorted(cb.items())]
             lines.append(f"  - 취소: {t.cancellation_count}건 ({', '.join(parts)})")
         if t.risk_blocks:
-            # v3 결정 #2: 리스크 차단은 code 별 카운트만
+            # v3 결정 #2: 리스크 차단은 code 별 카운트만 (종목·사유별 1일 1건)
             rb = t.risk_block_breakdown
             parts = [f"{code} {cnt}" for code, cnt in sorted(rb.items())]
-            lines.append(f"  - 리스크 차단: {t.risk_block_count}건 ({', '.join(parts)})")
+            lines.append(f"  - 리스크 차단: {t.risk_block_count}건 ({', '.join(parts)}) · 종목·사유별 1건")
+        lines.append("")
+
+    # 운영 — 실행 중단 구간 · 장전 브리핑 적중
+    if report.runtime_gaps or report.briefing_summary:
+        lines.append("■ 운영")
+        if report.runtime_gaps:
+            lines.append(f"  - 실행 중단: {', '.join(report.runtime_gaps)}")
+        if report.briefing_summary:
+            lines.append(f"  - 뉴스 브리핑: {report.briefing_summary}")
         lines.append("")
 
     # 리스크 상태
@@ -272,6 +281,13 @@ def render_embed(report: DailyReport) -> dict[str, Any]:
             "value": "\n".join(lines_fail),
             "inline": False,
         })
+    ops: list[str] = []
+    if report.runtime_gaps:
+        ops.append(f"실행 중단: {', '.join(report.runtime_gaps)}")
+    if report.briefing_summary:
+        ops.append(f"뉴스 브리핑: {report.briefing_summary}")
+    if ops:
+        fields.append({"name": "■ 운영", "value": "\n".join(ops), "inline": False})
     if report.next_actions:
         fields.append({
             "name": "■ 다음 액션",

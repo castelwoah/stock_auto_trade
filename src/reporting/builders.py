@@ -88,8 +88,11 @@ def _load_trades_by_day(session: Session, d: date) -> list[Trade]:
 
 
 def _load_risk_blocks_by_day(session: Session, d: date) -> list[RiskEvent]:
+    """당일 risk_blocked — (종목, 전략, 사유) 당 첫 1건만.
+
+    pipeline 이 1일 1회만 기록하지만, 그 전(10-27 이전) 기록은 tick 마다 쌓여 있다."""
     start, end = _day_bounds(d)
-    return (
+    rows = (
         session.query(RiskEvent)
         .filter(
             RiskEvent.ts >= start,
@@ -99,6 +102,14 @@ def _load_risk_blocks_by_day(session: Session, d: date) -> list[RiskEvent]:
         .order_by(RiskEvent.ts.asc())
         .all()
     )
+    seen: set[tuple] = set()
+    out: list[RiskEvent] = []
+    for e in rows:
+        key = (e.symbol, (e.detail or "").split(":", 1)[0], e.action_taken)
+        if key not in seen:
+            seen.add(key)
+            out.append(e)
+    return out
 
 
 def _trade_to_buy_entry(t: Trade) -> TradeEntry:
@@ -252,8 +263,16 @@ def build_daily_report(
         risk_blocks=risk_blocks,
     )
 
+    gap_rows = (
+        session.query(RiskEvent.detail)
+        .filter(RiskEvent.ts >= start, RiskEvent.ts <= end, RiskEvent.event_type == RUNTIME_GAP_EVENT)
+        .order_by(RiskEvent.ts.asc())
+        .all()
+    )
+
     return DailyReport(
         report_date=report_date,
+        runtime_gaps=[d for (d,) in gap_rows if d],
         market=market or MarketSummary(),
         data=data_summary,
         trades=trade_summary,
@@ -266,6 +285,7 @@ def build_daily_report(
     )
 
 
+RUNTIME_GAP_EVENT = "runtime_gap"         # scheduler.heartbeat 가 기록
 NEWS_UNIVERSE_VER = "news-universe-v1"   # strategy.universe.SCORING_VER (계층 역참조 회피)
 SHADOW_COMPARE_EVENT = "shadow_compare"
 

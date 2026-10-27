@@ -15,12 +15,15 @@ Startup sequence:
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import logging
 import signal
 import sys
 import threading
 import time
+from datetime import timedelta
 
+from src.analysis.llm_judge import ClaudeJudge
 from src.clients.discord import DiscordNotifier
 from src.clients.kis import KisClient
 from src.common.clock import now_kst, today_kst
@@ -28,12 +31,16 @@ from src.common.redact import RedactingFormatter, register_secrets
 from src.config import get_settings
 from src.ingestion.service import NewsService
 from src.persistence.db import init_db, session_scope
+from src.persistence.models import RiskEvent
 from src.reporting.archiver import Archiver
 from src.reporting.builders import build_daily_report, build_midday_snapshot
 from src.reporting.daily_report import send_daily_report
 from src.reporting.midday_report import in_valid_window, send_midday_report
+from src.reporting import news_briefing as nb
+from src.reporting.builders import RUNTIME_GAP_EVENT
 from src.runtime import ReportState, TradingRuntime
 from src.scheduler.app import TradingScheduler, register_default_jobs
+from src.scheduler.heartbeat import Gap, GapMonitor
 
 
 LOG_FORMAT = "%(asctime)s %(levelname)s %(name)s: %(message)s"
@@ -48,6 +55,7 @@ def _setup_logging() -> None:
 def _register_secrets(settings) -> None:
     """로그·Discord 출력에서 값 그대로 가릴 비밀값 (계좌번호·키·웹훅)."""
     dart = settings.DART_API_KEY.get_secret_value() if settings.DART_API_KEY else None
+    anthropic = settings.ANTHROPIC_API_KEY.get_secret_value() if settings.ANTHROPIC_API_KEY else None
     register_secrets([
         settings.CANO,
         f"{settings.CANO}-{settings.ACNT_PRDT_CD}",
@@ -55,6 +63,7 @@ def _register_secrets(settings) -> None:
         settings.APP_SECRET.get_secret_value(),
         settings.DISCORD_WEBHOOK_URL.get_secret_value(),
         dart,
+        anthropic,
     ])
 
 
@@ -75,6 +84,19 @@ def _daily_state_kwargs(st: ReportState | None) -> dict:
     return dict(market=st.market, portfolio=st.portfolio, risk=st.risk)
 
 
+def _record_gap(gap: Gap) -> None:
+    with session_scope() as session:
+        session.add(RiskEvent(ts=gap.end, event_type=RUNTIME_GAP_EVENT,
+                              detail=gap.label(), action_taken="resumed"))
+
+
+def _briefing_judge(settings) -> ClaudeJudge | None:
+    if settings.ANTHROPIC_API_KEY is None:
+        return None
+    return ClaudeJudge(api_key=settings.ANTHROPIC_API_KEY.get_secret_value(),
+                       model=settings.BRIEFING_MODEL)
+
+
 def _make_job_handlers(settings, kis, notifier, runtime, news):
     """Job bodies.
 
@@ -82,8 +104,55 @@ def _make_job_handlers(settings, kis, notifier, runtime, news):
     - midday_report / daily_report: DB 기반 리포트 (v3.1)
     - master_refresh / news_collect / analyze_score: NewsService (news-universe-v1)
       → 수집 후마다 runtime.refresh_universe 로 감시 종목 교체
+    - heartbeat: 1분 — 실행 중단(절전·단절) 감지 → 알림 + RiskEvent(runtime_gap)
+    - news_briefing: 08:40 장전 종목 브리핑 (BRIEFING_ENABLED, 정보용)
     모든 핸들러는 예외를 삼키고 알린다 — 한 job 실패가 스케줄러를 멈추지 않게.
     """
+    gaps = GapMonitor(notify=notifier.send, record=_record_gap)
+
+    def heartbeat():
+        try:
+            gaps.beat()
+        except Exception:
+            logging.exception("heartbeat failed")
+
+    def change_pct(symbol: str) -> float | None:
+        return kis.get_quote(symbol).change_pct
+
+    def news_briefing():
+        if not settings.BRIEFING_ENABLED:
+            return
+        now = now_kst()
+        if not nb.in_briefing_window(now):
+            logging.warning("[job] news_briefing out of window (%s), skipping", now.time())
+            return
+        logging.info("[job] news_briefing — 장전 종목 브리핑")
+        try:
+            with session_scope() as session:
+                b = nb.build_briefing(
+                    session, now=now, names=news.names(now.date()),
+                    judge=_briefing_judge(settings), count=settings.BRIEFING_COUNT,
+                    candidates=settings.BRIEFING_CANDIDATES,
+                    min_confidence=settings.NEWS_MIN_CONFIDENCE, prev_change=change_pct,
+                )
+            acc = nb.accuracy_line(settings.ARCHIVE_ROOT, until=now.date() - timedelta(days=1))
+            notifier.send_embed(nb.render_embed(b, accuracy=acc))
+            nb.write_archive(settings.ARCHIVE_ROOT, b)
+            logging.info("news briefing sent: %d items (engine=%s)", len(b.items), b.engine)
+        except Exception:
+            logging.exception("news_briefing failed")
+            notifier.send(f"[main] news_briefing 실패: {now_kst().isoformat()}")
+
+    def briefing_summary(today) -> str | None:
+        try:
+            res = nb.evaluate_day(settings.ARCHIVE_ROOT, today, change_pct)
+        except Exception:
+            logging.exception("briefing evaluation failed")
+            return None
+        if res is None:
+            return None
+        return nb.accuracy_line(settings.ARCHIVE_ROOT, today=res, until=today)
+
     def master_refresh():
         logging.info("[job] master_refresh — kospi/kosdaq mst (D9)")
         try:
@@ -157,6 +226,9 @@ def _make_job_handlers(settings, kis, notifier, runtime, news):
                     news_min_score=settings.NEWS_MIN_SCORE,
                     **_daily_state_kwargs(st),
                 )
+                summary = briefing_summary(today)
+                if summary:
+                    report = dataclasses.replace(report, briefing_summary=summary)
                 send_daily_report(notifier, report)
                 archiver.write_daily_report(report)
                 archiver.write_trades_csv(report)
@@ -181,6 +253,8 @@ def _make_job_handlers(settings, kis, notifier, runtime, news):
         "trading_tick": trading_tick,
         "midday_report": midday_report,
         "daily_report": daily_report,
+        "heartbeat": heartbeat,
+        "news_briefing": news_briefing,
     }
 
 
@@ -223,6 +297,8 @@ def main(argv: list[str] | None = None) -> int:
         midday_report=jobs["midday_report"],
         daily_report=jobs["daily_report"],
         news_poll_minutes=settings.NEWS_POLL_MINUTES,
+        heartbeat=jobs["heartbeat"],
+        news_briefing=jobs["news_briefing"],
     )
 
     if args.dry_run:

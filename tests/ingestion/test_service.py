@@ -64,3 +64,45 @@ def test_no_master_skips_collect(tmp_path, factory):
 def test_dart_only_with_key():
     assert [s.slug for s in default_scrapers(make_settings())] == ["yonhap_rss"]
     assert [s.slug for s in default_scrapers(make_settings(DART_API_KEY="k" * 40))] == ["yonhap_rss", "dart"]
+
+
+class _CountingFetch:
+    def __init__(self, fail=False):
+        self.calls, self.fail = 0, fail
+
+    def __call__(self, url):
+        self.calls += 1
+        if self.fail:
+            raise OSError("dns")
+        return _fetch(url)
+
+
+def _stale_store(tmp_path, fetch):
+    """전일(10-22) 보관본만 있는 상태 — 07:30 갱신을 놓친 아침."""
+    MasterStore(tmp_path, fetch=_fetch).refresh(datetime(2026, 10, 22).date())
+    return MasterStore(tmp_path, fetch=fetch)
+
+
+def test_collect_catches_up_missed_master(tmp_path, factory):
+    fetch = _CountingFetch()
+    svc = NewsService(make_settings(), store=_stale_store(tmp_path, fetch),
+                      scrapers=lambda: [Feed()], session_factory=factory)
+    svc.collect(NOW)
+    assert fetch.calls == 2                                   # kospi + kosdaq
+    assert svc.master(NOW.date()).as_of == "20261023"
+    svc.collect(NOW.replace(minute=50))
+    assert fetch.calls == 2                                   # 오늘자 있으면 재수신 안 함
+
+
+def test_master_catch_up_failure_keeps_stale_and_retries_later(tmp_path, factory):
+    fetch = _CountingFetch(fail=True)
+    svc = NewsService(make_settings(), store=_stale_store(tmp_path, fetch),
+                      scrapers=lambda: [Feed()], session_factory=factory)
+    r = svc.collect(NOW)
+    assert r is not None and r.inserted == 1                  # 전일 보관본으로 수집은 계속
+    assert svc.master(NOW.date()).as_of == "20261022"
+    calls = fetch.calls
+    svc.build_universe(NOW.replace(minute=50))                # 30분 이내 — 재시도 안 함
+    assert fetch.calls == calls
+    svc.collect(NOW.replace(hour=9, minute=15))               # 35분 뒤 — 재시도
+    assert fetch.calls > calls

@@ -21,7 +21,8 @@
 |---|---|---|
 | `SHADOW_MODE` | `true` | 전 파이프라인·리스크 게이트를 돌리되 **KIS 주문 송신만 생략** (`Trade.status='shadow'`). 실주문은 `false` 로 바꾸고 재시작 |
 | `SHADOW_CAPITAL_KRW` | 없음 | 섀도 모드 전용 **가상 자본**(원). 매수 금액·투입 상한·일일 손실 기준을 실계좌 대신 이 값으로 계산(실계좌 조회·Reconcile 은 그대로). 당일 섀도 매수는 투입액으로 누적. `SHADOW_MODE: false` 면 무시 |
-| `MAX_DEPLOY_PCT` | `5.0` | 09:00 평가액 대비 **전체 투입 상한** %. 미체결 매수 포함, 초과 매수는 `capital_cap` 차단. 금액이 1주 가격보다 작으면 `qty_zero` 로 기록 |
+| `MAX_DEPLOY_PCT` | `5.0` | 09:00 평가액 대비 **전체 투입 상한** %. 미체결 매수 포함, 초과 매수는 `capital_cap` 차단. 금액이 1주 가격보다 작으면 `qty_zero` 로 기록 (종목·사유별 하루 1건) |
+| `MAX_DEPLOY_SLOTS` | `3` | 매수 1건 금액 ≤ 투입 상한 ÷ 슬롯 수 — 첫 종목이 상한을 다 쓰지 않게 (예: 상한 50만 → 종목당 ≤16.7만). 이보다 비싼 종목은 `qty_zero` |
 | `TRADING_DISABLED` | `false` | 킬 스위치 (재시작 필요) |
 | `KILL_SWITCH_FILE` | `run/TRADING_DISABLED` | **파일이 존재하면 즉시 신규 매수 차단** (재시작 불필요, 청산은 계속) |
 | `ALLOC_BREAKOUT_PCT` / `ALLOC_NEWS_SWING_PCT` | `20` / `0` | 전략별 현금 배분 % |
@@ -32,6 +33,9 @@
 | `NEWS_MIN_CONFIDENCE` | `0.8` | 기사↔종목 매칭 확신도 하한 (D4) |
 | `NEWS_POLL_MINUTES` / `NEWS_HALF_LIFE_HOURS` | `10` / `12` | 수집 간격(08:00~14:50) / 뉴스 점수 반감기 |
 | `UNIVERSE_COMPARE_STATIC` | `true` | 섀도 비교 — watchlist 돌파 신호를 `RiskEvent(shadow_compare)` 로 기록, 일일 리포트에서 나란히 표시 |
+| `BRIEFING_ENABLED` | `false` | 08:40 장전 뉴스 종목 브리핑 (Discord Embed, **정보용 — 매매 미반영**). 재시작 필요 |
+| `ANTHROPIC_API_KEY` | 없음 | 브리핑 판단용 Claude API 키 (민감정보). 없으면 룰 기준으로 대체되고 footer 에 `룰 기준 (LLM 키 없음)` 표시 |
+| `BRIEFING_MODEL` / `BRIEFING_COUNT` / `BRIEFING_CANDIDATES` | `claude-haiku-5-5` / `3` / `6` | 판단 모델 / 보낼 종목 수 / 모델에 넘길 후보 수 |
 | `DART_API_KEY` | 없음 | 있으면 OpenDART 공시도 수집 (종목코드 직접 매핑) |
 
 긴급 매수 중단: `touch $PROJECT_ROOT/run/TRADING_DISABLED` → 해제: `rm $PROJECT_ROOT/run/TRADING_DISABLED`
@@ -108,6 +112,18 @@
 - **사후 점검**:
   - ISP / 라우터 / DNS 서버 로그 확인.
   - 장시간 단절 구간의 미실행 주문 영향도 기록.
+
+#### 3.2.1 노트북 절전·최대 절전 / 이동 중 실행 중단 (10-27 사례)
+
+- **징후**: Discord `⏸ 실행 중단 감지 07:15~08:32 (1h17m) · 복구됨`, 일일 리포트 `■ 운영 — 실행 중단: …`.
+  로그에 `was missed by` 경고 (5분 넘게 늦은 cron job 은 건너뜀).
+- **자동 복구** (조치 불필요):
+  - 09:00 prepare 를 놓치면 다음 tick 이 prepare 를 다시 실행한다 (`tick before prepare — preparing now`).
+  - 07:30 마스터 갱신을 놓치면 뉴스 수집·universe 빌드 때 오늘자 마스터를 받는다 (실패 시 30분 간격 재시도, 그동안 전일 보관본 사용).
+  - 깨어난 직후 네트워크가 없어 중단 알림이 실패하면 다음 heartbeat(1분)에 재전송.
+- **주의**: 복귀 직후 첫 tick 에 이미 돌파한 종목이 한꺼번에 신호를 낼 수 있다 (10-27 10:38 — 16종목).
+  중단 구간은 `RiskEvent(event_type='runtime_gap')` 으로 남으니 B1·B2 지표에서 제외한다.
+- **예방**: 장중(08:30~15:30)에는 절전 해제·전원 연결.
 
 ---
 
@@ -203,6 +219,7 @@
 - **회전 주기**:
   - `APP_SECRET`: **90일**.
   - `DISCORD_WEBHOOK_URL`: 노출 의심 시 **즉시 폐기 + 재발급**.
+- `ANTHROPIC_API_KEY`(브리핑, 선택): 노출 의심 시 콘솔에서 폐기·재발급. 로그·Discord 에서는 `sk-ant-` 패턴으로 가려진다.
 - 유출 시 즉시 `systemctl stop mini-trading` 후 키 회전.
 
 ---

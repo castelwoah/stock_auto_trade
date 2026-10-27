@@ -51,7 +51,8 @@ mini_project/
 │   │   ├── scorer.py       # 가중합(news30/fin25/tech25/flow20), CANDIDATE_THRESHOLD=70, D12 메타
 │   │   ├── technical.py    # RSI14 Wilder + MA5/20/60 + MACD (3봉 cross 창, eps 1e-9)
 │   │   ├── financial.py    # 부채비율·ROE·영업이익률·OCF, 균등 평균
-│   │   └── flow.py         # 외국인·기관 5d 순매수, 5d/60d 거래량비 (market_cap 정규화)
+│   │   ├── flow.py         # 외국인·기관 5d 순매수, 5d/60d 거래량비 (market_cap 정규화)
+│   │   └── llm_judge.py    # 10-27 — 브리핑용 Claude API 판단 (tool_use JSON 검증) + 룰 대체 (매매 미반영)
 │   ├── risk/               # W4 신설 (서브에이전트 금지 영역)
 │   │   ├── exceptions.py   # RiskBlocked(code, detail)
 │   │   ├── blacklist.py    # StaticBlacklist + LiquidityThresholds (시총<500억/거래대금<10억)
@@ -72,6 +73,7 @@ mini_project/
 │   │   ├── pnl_calc.py      # v3 신설 — FIFO BUY↔SELL 매칭, 비용 반영 (스키마 무변경)
 │   │   ├── builders.py      # v3.1 신설 — DB 조회 기반 build_daily_report / build_midday_snapshot
 │   │   ├── intraday.py      # 체결·리스크 즉시 Embed + notify_* helpers
+│   │   ├── news_briefing.py # 10-27 — 08:40 장전 뉴스 종목 브리핑 (선정·판단·Embed·reports/briefing JSON·16:00 적중)
 │   │   └── archiver.py      # 일별 JSON + trades CSV + 연간 세금 CSV
 │   ├── backtest/           # W7 린 신설 (v2)
 │   │   ├── portfolio_sim.py # SimFill/SimPosition + idempotency D8 + 왕복 1.03% 비용 (slip 0.25+fee 0.15+tax 0.23)
@@ -87,7 +89,8 @@ mini_project/
 │   ├── scheduler/          # W8 신설
 │   │   ├── calendar.py      # KRX 2026 휴장일 (Agent), is_business_day / next·prev / business_days_between
 │   │   ├── watchlist.py     # 29종목 예비 watchlist (legacy 12 + KOSPI 10 + KOSDAQ 7, 091990 상장폐지 제외)
-│   │   └── app.py           # APScheduler wrapper — 영업일 게이트 / misfire 300s / cron + interval 헬퍼
+│   │   ├── app.py           # APScheduler wrapper — 영업일 게이트 / misfire 300s / cron + interval 헬퍼
+│   │   └── heartbeat.py     # 10-27 — 1분 heartbeat, 10분↑ 간격이면 실행 중단 알림 + RiskEvent(runtime_gap)
 │   ├── main.py             # W8 엔트리포인트 — config→clients→runtime→scheduler wire-up, SIGINT/SIGTERM graceful shutdown
 │   ├── runtime.py          # Phase A: TradingRuntime — 09:00 prepare / 5분 tick 본체 (시세·종목상태·지수 → pipeline)
 │   ├── common/clock.py     # now_kst / today_kst — 시각 단일 기준 KST
@@ -536,6 +539,18 @@ W8 (모의투자)   → 단일 세션 (관찰·튜닝)
 - 테스트 731 → **741 pass**.
 - **리포트 실값 + 체결 알림 (사용자 승인)**: 미드데이·일일 리포트가 기본값(`-`·₩0·0%)만 찍던 문제 — builder 에 런타임 값 미주입. `runtime.report_state()` 신설(마지막 tick 의 지수 수치·등락률, 평가액(섀도 가상이면 "(가상)"), 당일 손익, Daily Loss 사용률, CB), 16:00 은 지수 재조회. 누적·MDD 는 `DailyPnl` 전까지 `-`. KIS `get_index` 가 `bstp_nmix_prpr`(지수) 함께 반환 — 실 API 로 확인. 수집 뉴스 수를 매체 분포와 같은 `retrieved_at` 기준으로, 후보 수·문구를 `NEWS_MIN_SCORE` 로. 체결 Embed 를 `OrderManager._close_trade` 에 연결(주문 1건당 1회, 부분 체결 표기, 매도 손익은 수수료·세금 반영, 섀도 제외, 알림 실패는 주문 처리와 격리), 종목명은 `runtime.symbol_name`.
 - 테스트 741 → **762 pass**.
+
+### 2026-10-27
+- **운영 관찰**: 노트북 최대 절전 + 이동 중 네트워크 단절로 07:15~08:32 · 09:35~10:38 실행 중단 (DNS 실패 포함). 09:00 prepare 실패 → 10:38 tick 에서 자동 재준비. 07:30 마스터 갱신은 300초 misfire 초과로 건너뜀. 가상 자본은 정상 적용(상한 50만) → 첫 섀도 매수 2건(247540 5주 · 036540 1주). 그러나 종목당 금액(66.7만) > 상한(50만)이라 첫 종목이 상한을 소진, 이후 `qty_zero` 가 tick 마다 75건 기록.
+- **발견 — 룰 감성 오판**: 삼성전자 기사 7건 중 "급등"·"주주환원" 기사는 0점, 과징금 기사만 부정 → 뉴스 점수 0 → 악재 차단. 키워드 사전 누락이 원인 (보강은 브리핑 LLM↔룰 불일치 데이터를 근거로 추후 제안).
+- **수정 (사용자 승인, 권장안 전부)**:
+    - 1A `MAX_DEPLOY_SLOTS`(3) — 매수 1건 ≤ min(상한 잔여, 상한 ÷ 슬롯). `pipeline._clip_to_capital_cap`. 10-27 데이터 재계산 시 3종목 분산(1·18·2주).
+    - 2A `risk_blocked` 를 (날짜·종목·전략·사유) 당 1회만 기록(메모리 + DB 확인 → 재시작에도 유지), 반복 로그는 DEBUG. 리포트 집계도 같은 기준으로 중복 제거(10-27 이전 기록 포함).
+    - 3a `NewsService.ensure_master` — 수집·universe 빌드 때 오늘자 마스터가 없으면 갱신(실패 시 30분 간격 재시도, 전일 보관본 유지).
+    - 3b `scheduler/heartbeat.py` — 1분 heartbeat, 10분↑ 간격이면 Discord `⏸ 실행 중단 감지` + `RiskEvent(runtime_gap)`. 전송 실패 시 다음 beat 재전송. 일일 리포트 `■ 운영` 섹션.
+    - 4 장전 뉴스 브리핑 — `analysis/llm_judge.py` + `reporting/news_briefing.py`, 08:40 job(총 9 job). Claude API(`claude-haiku-5-5`, tool_use 강제 + 재검증, requests 직접 호출 — 새 의존성 없음), 키 없음·실패 시 룰 대체 표시. 정보용(매매 미반영), 08:35~09:05 윈도우, 결과·모델·프롬프트 해시·입력 기사 ID 는 `reports/briefing/*.json`(스키마 무변경), 16:00 적중 평가. `BRIEFING_ENABLED` 기본 false, `ANTHROPIC_API_KEY` 는 redact 등록 + `sk-ant-` 패턴.
+- 테스트 762 → **819 pass**. 신규 모듈 커버리지 heartbeat 100% / news_briefing 99% / llm_judge 95%, 전체 95%.
+- **사용자 작업**: 브리핑을 켜려면 `config.yaml` 에 `BRIEFING_ENABLED: true` + `ANTHROPIC_API_KEY` 추가 후 재시작(또는 다음 07:00 기동).
 
 ## Notes
 

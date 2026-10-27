@@ -128,12 +128,15 @@ def register_default_jobs(
     midday_report: SchedulerJob,     # v3 추가
     daily_report: SchedulerJob,
     news_poll_minutes: int = 10,
+    heartbeat: SchedulerJob | None = None,
+    news_briefing: SchedulerJob | None = None,
 ) -> dict[str, str]:
     """rules §5.1 타임라인 + v3 미드데이 리포트 타임라인에 맞춰 기본 작업 등록.
 
     타임라인 (영업일만):
       07:30 master / 08:00~14:50 news (간격 news_poll_minutes) / 08:50 universe / 09:00 state /
       09:10~15:20 tick / **12:00 midday** / 16:00 report
+    선택: heartbeat (1분, 종일 — 실행 중단 감지) / news_briefing (08:40 장전 종목 브리핑)
     """
     out: dict[str, str] = {}
     out["master_refresh"] = sched.add_cron(master_refresh, name="master_refresh", hour=7, minute=30)
@@ -149,4 +152,10 @@ def register_default_jobs(
     )
     out["midday_report"] = sched.add_cron(midday_report, name="midday_report", hour=12, minute=0)
     out["daily_report"] = sched.add_cron(daily_report, name="daily_report", hour=16, minute=0)
+    if heartbeat is not None:
+        out["heartbeat"] = sched.add_interval_window(
+            heartbeat, name="heartbeat", start=time.min, end=time.max, step_min=1,
+        )
+    if news_briefing is not None:
+        out["news_briefing"] = sched.add_cron(news_briefing, name="news_briefing", hour=8, minute=40)
     return out

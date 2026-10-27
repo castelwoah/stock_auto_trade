@@ -43,3 +43,8 @@ def test_formatter_redacts_traceback():
         rec = logging.LogRecord("x", logging.ERROR, __file__, 1, "fail %s", ("87654321",), sys.exc_info())
     out = fmt.format(rec)
     assert "87654321" not in out and "RuntimeError" in out
+
+
+def test_anthropic_key_pattern():
+    out = redact("auth failed for sk-ant-api03-AbC_d-123 at api")
+    assert "AbC_d-123" not in out and "sk-ant-" not in out

@@ -99,14 +99,16 @@ sudo systemctl enable --now mini-trading-start.timer
 | 03:30 | crontab | SQLite DB 백업 → `logs/trading.db.YYYYMMDD.bak` |
 | 일 04:00 | crontab | 7일 이상 경과 DB 백업 삭제 |
 | **07:00** | **systemd timer** | **데몬 기동** |
-| 07:30 | APScheduler (내부) | KOSPI/KOSDAQ master 갱신 (D9) |
+| 07:00~17:00 | APScheduler | 1분 heartbeat — 10분 넘게 벌어지면 `⏸ 실행 중단 감지` 알림 + `RiskEvent(runtime_gap)` |
+| 07:30 | APScheduler (내부) | KOSPI/KOSDAQ master 갱신 (D9). 놓치면 뉴스 수집·universe 빌드 때 따라잡기 |
 | 08:00~14:50 | APScheduler | 뉴스 수집 (연합 RSS + DART 키 있으면), `NEWS_POLL_MINUTES` 간격 → 감시 종목 재구성 |
+| 08:40 | APScheduler | 장전 뉴스 종목 브리핑 (`BRIEFING_ENABLED`, 08:35~09:05 밖이면 생략) |
 | 08:50 | APScheduler | 감시 종목 구성 (장 시작 전 확정본, `StockScore news-universe-v1` 기록) |
 | 09:00 | APScheduler | DailyLossState start_equity 고정 (D7) + reconciler.verify (D6) |
 | 09:10~15:20 | APScheduler | 5분 간격 trading tick |
 | 15:00 | (내부) | 신규 매수 cut-off |
 | 15:15 | (내부) | EOD 미체결 일괄 취소 |
-| 16:00 | APScheduler | 일일 리포트 → Discord + JSON/CSV 아카이브 |
+| 16:00 | APScheduler | 일일 리포트 → Discord + JSON/CSV 아카이브 (브리핑 적중 평가 포함) |
 | **17:00** | **systemd timer** | **데몬 종료 (SIGTERM)** |
 
 ## 5. Phase 전환 (설정 파일 불변)

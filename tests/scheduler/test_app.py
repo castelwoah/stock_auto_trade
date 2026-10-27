@@ -63,3 +63,18 @@ def test_misfire_grace_is_300s():
     sched.add_cron(MagicMock(), name="t", hour=9)
     job = sched.scheduler.get_job("t")
     assert job.misfire_grace_time == 300
+
+
+def test_optional_heartbeat_and_briefing_jobs():
+    sched = TradingScheduler()
+    jobs = register_default_jobs(
+        sched,
+        master_refresh=MagicMock(), news_collect=MagicMock(), analyze_score=MagicMock(),
+        prepare_state=MagicMock(), trading_tick=MagicMock(), midday_report=MagicMock(),
+        daily_report=MagicMock(), heartbeat=MagicMock(), news_briefing=MagicMock(),
+    )
+    assert {"heartbeat", "news_briefing"} <= set(jobs)
+    assert len(sched.scheduler.get_jobs()) == 9
+    assert "minutes=1" in str(sched.scheduler.get_job("heartbeat").trigger) or \
+        sched.scheduler.get_job("heartbeat").trigger.interval.total_seconds() == 60
+    assert "hour='8', minute='40'" in str(sched.scheduler.get_job("news_briefing").trigger)

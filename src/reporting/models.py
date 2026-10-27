@@ -170,6 +170,8 @@ class DailyReport:
     next_actions: list[str] = field(default_factory=list)
     strategy_version: str = "v1.0"
     news_universe: NewsUniverseSummary | None = None
+    runtime_gaps: list[str] = field(default_factory=list)    # "07:15~08:32 (1h17m)" — 실행 중단 구간
+    briefing_summary: str | None = None                       # "적중 2/3 · 누적 5/8" — 장전 뉴스 브리핑
 
 
 # ---------------------------------------------------------------------------

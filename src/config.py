@@ -84,6 +84,8 @@ class Settings(BaseSettings):
     # --- 실전 운용 안전장치 (Phase A, 2026-10) ---
     # 투입 상한: 09:00 시작 평가액 대비 %. 전체 포지션 평가액 + 신규 매수 ≤ 상한
     MAX_DEPLOY_PCT: float = Field(default=5.0, gt=0.0, le=100.0)
+    # 한 번 매수 금액 ≤ 투입 상한 ÷ 슬롯 수 — 첫 종목이 상한을 다 쓰지 않도록 (breakout 최대 3종목)
+    MAX_DEPLOY_SLOTS: int = Field(default=3, ge=1, le=20)
     # 킬 스위치: True 이거나 파일이 존재하면 신규 매수 차단 (청산은 진행)
     TRADING_DISABLED: bool = False
     KILL_SWITCH_FILE: Path = Field(default_factory=lambda: PROJECT_ROOT / "run" / "TRADING_DISABLED")
@@ -113,6 +115,14 @@ class Settings(BaseSettings):
     NEWS_POLL_MINUTES: int = Field(default=10, ge=1, le=60)
     NEWS_HALF_LIFE_HOURS: float = Field(default=12.0, gt=0.0)
     MASTER_DIR: Path = Field(default_factory=lambda: PROJECT_ROOT / "data" / "master")
+
+    # --- 장전 뉴스 종목 브리핑 (10-27) — 정보용, 매매 미반영 ---
+    # ANTHROPIC_API_KEY 가 없으면 룰 기준으로 대체(표시). 결과는 ARCHIVE_ROOT/briefing/*.json
+    BRIEFING_ENABLED: bool = False
+    BRIEFING_COUNT: int = Field(default=3, ge=1, le=5)          # 보낼 종목 수
+    BRIEFING_CANDIDATES: int = Field(default=6, ge=1, le=15)    # LLM 에 넘길 후보 수
+    BRIEFING_MODEL: str = "claude-haiku-5-5"
+    ANTHROPIC_API_KEY: SecretStr | None = None
 
     def kill_switch_on(self) -> bool:
         return self.TRADING_DISABLED or self.KILL_SWITCH_FILE.exists()

@@ -2,11 +2,14 @@
 
 마스터·resolver 는 프로세스 메모리에 두고, 데몬이 장중에 재시작되면 최근 보관본을
 다시 읽는다 (없으면 즉시 수신). 각 메서드는 자체 DB 세션을 연다.
+
+07:30 master_refresh 를 놓치면(절전·네트워크 단절 — 늦은 cron 은 300초 넘으면 건너뜀)
+수집·universe 빌드 때 오늘자 마스터를 따라잡아 받는다 (실패 시 MASTER_RETRY 간격으로 재시도).
 """
 from __future__ import annotations
 
 import logging
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from typing import Callable, ContextManager
 
 from sqlalchemy.orm import Session
@@ -26,6 +29,7 @@ from src.strategy.universe import Universe, UniverseParams, build_universe, look
 logger = logging.getLogger(__name__)
 
 DART_MAX_PAGES = 10
+MASTER_RETRY = timedelta(minutes=30)
 
 
 def universe_params(settings: Settings) -> UniverseParams:
@@ -64,6 +68,7 @@ class NewsService:
         self.static = [(e.symbol, e.name) for e in build_initial_watchlist()]
         self._master: Master | None = None
         self._resolver: SymbolResolver | None = None
+        self._master_tried_at: datetime | None = None
 
     # ------------------------------------------------------------------
     def refresh_master(self, today: date) -> Master | None:
@@ -75,6 +80,18 @@ class NewsService:
         if self._master is None:
             self._set_master(self.store.load_latest() or self.store.refresh(today))
         return self._master
+
+    def ensure_master(self, now: datetime) -> Master | None:
+        """오늘자 마스터가 아니면 한 번 갱신 (실패하면 보관본 유지, MASTER_RETRY 후 재시도)."""
+        m = self.master(now.date())
+        if m is not None and m.as_of == now.strftime("%Y%m%d"):
+            return m
+        if self._master_tried_at is not None and now - self._master_tried_at < MASTER_RETRY:
+            return m
+        self._master_tried_at = now
+        logger.warning("master catch-up: have %s, need %s — refreshing",
+                       m.as_of if m else None, now.strftime("%Y%m%d"))
+        return self.refresh_master(now.date()) or m
 
     def names(self, today: date) -> dict[str, str]:
         m = self.master(today)
@@ -88,7 +105,7 @@ class NewsService:
 
     # ------------------------------------------------------------------
     def collect(self, now: datetime) -> CollectResult | None:
-        if self.master(now.date()) is None or self._resolver is None:
+        if self.ensure_master(now) is None or self._resolver is None:
             logger.warning("news_collect skipped — no symbol master available")
             return None
         with self._session() as s:
@@ -99,6 +116,7 @@ class NewsService:
         return r
 
     def build_universe(self, now: datetime) -> Universe:
+        self.ensure_master(now)
         names = self.names(now.date())
         with self._session() as s:
             return build_universe(s, now=now, params=universe_params(self.settings),
