@@ -343,10 +343,12 @@ def build_midday_snapshot(
     equity: float | None = None,
     equity_virtual: bool = False,
     next_actions: list[str] | None = None,
+    extra_positions: list[PositionSnapshot] | None = None,
 ) -> MidDaySnapshot:
     """12:00 시점 스냅샷 — 오전(09:10~12:00) 시도 + 현재 포지션 + 오후 후보.
 
     equity: 런타임 평가액(섀도 가상 자본 포함). None 이면 cash_available + 포지션 평가액.
+    extra_positions: DB Position 밖의 보유 (섀도 가상 포지션) — 목록·anomaly 탐지에 포함.
     """
     day = ts.date()
     prices = current_prices or {}
@@ -399,6 +401,11 @@ def build_midday_snapshot(
             unrealized_pnl_pct=pnl_pct,
             tp_armed=False,  # Position 테이블에 플래그 없음, in-memory 에서만
         ))
+
+    for snap in extra_positions or []:
+        total_position_value += snap.qty * snap.current_price
+        total_position_cost += snap.qty * snap.avg_price
+        positions.append(snap)
 
     # 4) 오후 후보 top-N
     scores = (

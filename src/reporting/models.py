@@ -172,6 +172,7 @@ class DailyReport:
     news_universe: NewsUniverseSummary | None = None
     runtime_gaps: list[str] = field(default_factory=list)    # "07:15~08:32 (1h17m)" — 실행 중단 구간
     briefing_summary: str | None = None                       # "적중 2/3 · 누적 5/8" — 장전 뉴스 브리핑
+    shadow: ShadowSummary | None = None                       # 섀도 가상 매매 (SHADOW_MODE 일 때만)
 
 
 # ---------------------------------------------------------------------------
@@ -189,6 +190,20 @@ class PositionSnapshot:
     unrealized_pnl_krw: float = 0.0
     unrealized_pnl_pct: float = 0.0
     tp_armed: bool = False
+
+
+@dataclass(frozen=True)
+class ShadowSummary:
+    """섀도 가상 포지션 하루 요약 — execution.shadow_book 이 만든다 (주문 미송신, 즉시 체결 가정)."""
+    buys: int = 0
+    sells: dict[str, int] = field(default_factory=dict)       # 청산 사유 라벨 → 건수
+    realized_pnl_krw: float = 0.0                              # 수수료·세금 반영
+    positions: list[PositionSnapshot] = field(default_factory=list)
+    open_after_eod: list[str] = field(default_factory=list)    # 마감 후에도 남은 당일 청산 전략 보유
+
+    @property
+    def sell_count(self) -> int:
+        return sum(self.sells.values())
 
 
 @dataclass(frozen=True)

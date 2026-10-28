@@ -157,6 +157,10 @@ class OrderManager:
         if qty <= 0 or limit_price <= 0:
             return None
         price = initial_price(signal.action, limit_price)
+        if self.shadow and signal.action == Action.SELL:
+            # 섀도 매도는 체결가 추정치로 기록 — 첫 지정가(−1%)는 실제로는 매수 1호가 근처에서
+            # 체결되므로, 지정가를 그대로 쓰면 가상 손익이 매번 약 1% 나쁘게 잡힌다
+            price = round_to_tick(limit_price, up=False)
 
         # D8 송신 게이트 — 기존 키면 송신하지 않는다
         trade = self.portfolio.insert_trade_if_new(TradeRecord(

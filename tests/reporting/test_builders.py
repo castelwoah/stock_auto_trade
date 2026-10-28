@@ -364,3 +364,15 @@ def test_daily_report_lists_runtime_gaps(session):
     session.commit()
     r = build_daily_report(session, report_date=date(2026, 4, 20))
     assert r.runtime_gaps == ["07:15~08:32 (1h17m)"]
+
+
+def test_midday_extra_positions_included_in_list_and_anomalies(session):
+    from src.reporting.models import PositionSnapshot
+
+    near_sl = PositionSnapshot(symbol="V", strategy_id="breakout", qty=10, avg_price=1000.0,
+                               current_price=955.0, unrealized_pnl_krw=-450.0, unrealized_pnl_pct=-4.5)
+    snap = build_midday_snapshot(session, ts=datetime(2026, 10, 29, 12, 0), extra_positions=[near_sl],
+                                 cash_available=1_000.0)
+    assert [p.symbol for p in snap.positions] == ["V"]
+    assert snap.total_equity == 1_000.0 + 9_550.0
+    assert any(a.code == "position_near_sl" for a in snap.anomalies)

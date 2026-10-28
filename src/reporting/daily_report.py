@@ -8,7 +8,7 @@ from __future__ import annotations
 from typing import Any
 
 from src.clients.discord import DiscordNotifier
-from src.reporting.models import DailyReport, TradeEntry
+from src.reporting.models import DailyReport, ShadowSummary, TradeEntry
 
 
 # Embed 색상 (Discord 10진수)
@@ -151,6 +151,10 @@ def render_text(report: DailyReport) -> str:
             lines.append(f"  - 리스크 차단: {t.risk_block_count}건 ({', '.join(parts)}) · 종목·사유별 1건")
         lines.append("")
 
+    if report.shadow is not None:
+        lines.extend(f"  {l}" if i else l for i, l in enumerate(_shadow_lines(report.shadow)))
+        lines.append("")
+
     # 운영 — 실행 중단 구간 · 장전 브리핑 적중
     if report.runtime_gaps or report.briefing_summary:
         lines.append("■ 운영")
@@ -181,6 +185,20 @@ def render_text(report: DailyReport) -> str:
         lines.append("  - (없음)")
     lines.append("=" * 33)
     return "\n".join(lines)
+
+
+def _shadow_lines(s: ShadowSummary) -> list[str]:
+    """섀도 가상 매매 — 첫 줄은 섹션 제목. 즉시 체결 가정 (주문 미송신)."""
+    sells = ", ".join(f"{k} {v}" for k, v in sorted(s.sells.items()))
+    out = ["■ 섀도 가상 매매 (즉시 체결 가정)",
+           f"- 매수 {s.buys}건 · 매도 {s.sell_count}건" + (f" ({sells})" if sells else ""),
+           f"- 실현손익(비용 반영): {s.realized_pnl_krw:+,.0f}원"]
+    if s.open_after_eod:
+        out.append(f"- ⚠ 마감 후 미청산: {', '.join(s.open_after_eod)} — 청산 경로 확인 필요")
+    elif s.positions:
+        out.append("- 보유: " + ", ".join(f"{p.name or p.symbol} {p.qty}주 ({p.unrealized_pnl_pct:+.1f}%)"
+                                         for p in s.positions))
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -281,6 +299,9 @@ def render_embed(report: DailyReport) -> dict[str, Any]:
             "value": "\n".join(lines_fail),
             "inline": False,
         })
+    if report.shadow is not None:
+        fields.append({"name": "■ 섀도 가상 매매",
+                       "value": "\n".join(_shadow_lines(report.shadow)[1:]), "inline": False})
     ops: list[str] = []
     if report.runtime_gaps:
         ops.append(f"실행 중단: {', '.join(report.runtime_gaps)}")

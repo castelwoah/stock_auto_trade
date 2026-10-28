@@ -82,6 +82,7 @@ mini_project/
 │   │   └── metrics.py       # Sharpe(252) / MDD / Win rate / PF(999 sentinel) / CAGR / Alpha + snapshot fixture
 │   ├── execution/          # W8 신설 (reconciler · order_manager 는 서브에이전트 금지 영역)
 │   │   ├── portfolio.py     # LivePortfolio (DB Position ↔ StrategyContext, Trade 멱등 INSERT, highest_price D3 영속)
+│   │   ├── shadow_book.py   # 10-28 — 섀도 Trade 로 가상 포지션 재구성 (청산 신호까지 섀도 실행, Position·Reconciler 무관)
 │   │   ├── reconciler.py    # KIS × DB 교차검증, 3회 연속 불일치 → trading_off + RiskEvent 기록 (D6), managed_only 옵션
 │   │   ├── order_manager.py # v4: 송신 게이트(D8) · 체결조회 동기화 · 취소 확인 후 잔량 재주문 · @risk_gate · shadow · 재시작 복원
 │   │   ├── krx_tick.py      # KRX 호가단위 정렬 / n호가 이동
@@ -558,7 +559,14 @@ W8 (모의투자)   → 단일 세션 (관찰·튜닝)
 - 테스트 819 → **830 pass** (breakout 100%, pipeline 96%).
 - **실전 스모크 테스트 (사용자 승인)**: 읽기 전용 10:07 PASS 6 / WARN 1 — `hts_avls` **억원 확인**. 실주문 11:33 카카오(035720) 1주 @27,350(−10%) 매수 → 취소, PASS 10 / WARN 1 / FAIL 0 — 체결조회 `ord_gno_brno` = 주문 응답 `KRX_FWDG_ORD_ORGNO` **확인**, 체결 0·잔량 0.
 - **발견·수정 — 수동취소 미감지**: 실전 원주문 행은 취소 뒤에도 `cncl_yn` 이 빈 값 → `cncl_yn=='Y'` 가정으로는 HTS 수동취소를 못 알아채 주문이 열린 채 남음(매수는 상한 점유, 매도는 재매도 안 됨, 취소 재시도 실패 알림). 봇 자체 취소는 취소 API 결과로 판단해 영향 없음. `kis._parse_fill` 이 `cncl_yn=='Y'` **또는 잔량 0 · 체결 < 주문수량** 이면 취소로 판정. 10-28 원문으로 회귀 테스트.
-- 테스트 830 → **835 pass**. 남은 확인: `mrkt_warn_cls_code` 01/02/03 · `vi_cls_code` 발동 원값(해당 종목 발생 시), 실전 초당 한도(R5).
+- **섀도 가상 포지션 (사용자 승인, 권장안)**: 섀도 매수가 포지션을 만들지 않아 SL/Trailing/EOD 청산이 섀도에서 한 번도 돌지 않았음(10-26 제약) → B3 파일럿 전에 매도 경로를 리스크 없이 확인하려고 추가.
+    - `execution/shadow_book.py` — `status=shadow` Trade 재생으로 가상 포지션(가중평균·부분 매도). **Position 테이블·Reconciler 미사용** (넣으면 실계좌 불일치로 매매 OFF). 2026-10-29 이전 기록 무시(매도 기록 없는 과거 매수 배제).
+    - pipeline: 섀도면 가상 포지션을 전략에 넘김(실포지션 우선) → 청산 신호가 섀도 매도로 기록. 투입액 = 가상 보유 평가액(팔면 상한·슬롯이 비워짐). 가상 포지션 조회 실패 tick 은 매수만 차단(fail-closed).
+    - order_manager: 섀도 매도는 현재가 내림 정렬로 기록(−1% 지정가를 쓰면 손익이 매번 ~1% 과소). 실주문 경로 무변경.
+    - runtime: 가상 보유 종목도 시세 조회(감시 종목에서 빠져도 청산 가능), 가상 계좌 = 자본 − 보유 원가 + 당일 실현손익(비용 반영) → Daily Loss 게이트도 섀도에서 작동. prepare 메시지에 가상 보유 표시.
+    - 리포트: 16:00 `■ 섀도 가상 매매` (매수·사유별 매도·실현손익·**마감 후 미청산 ⚠**), 12:00 보유·근접 anomaly 포함. 장중 Discord 알림 없음.
+    - 결정(권장안): 고점은 메모리만(재시작 시 max(평균단가, 현재가)), 섀도 매도가 = 현재가, 알림은 리포트만. 한계: 즉시 전량 체결 가정.
+- 테스트 830 → 835(취소 판정) → **860 pass** (shadow_book 100%, pipeline 97%). 남은 확인: `mrkt_warn_cls_code` 01/02/03 · `vi_cls_code` 발동 원값(해당 종목 발생 시), 실전 초당 한도(R5).
 
 ## Notes
 

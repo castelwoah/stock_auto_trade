@@ -75,7 +75,8 @@ def _midday_state_kwargs(st: ReportState | None) -> dict:
         return {"next_actions": [NO_RUNTIME_STATE]}
     return dict(market=st.market, risk=st.risk, current_prices=st.prices,
                 cash_available=st.cash, equity=st.portfolio.total_value,
-                equity_virtual=st.portfolio.virtual)
+                equity_virtual=st.portfolio.virtual,
+                extra_positions=list(st.shadow.positions) if st.shadow else None)
 
 
 def _daily_state_kwargs(st: ReportState | None) -> dict:
@@ -229,6 +230,8 @@ def _make_job_handlers(settings, kis, notifier, runtime, news):
                 summary = briefing_summary(today)
                 if summary:
                     report = dataclasses.replace(report, briefing_summary=summary)
+                if st is not None and st.shadow is not None:
+                    report = dataclasses.replace(report, shadow=st.shadow)
                 send_daily_report(notifier, report)
                 archiver.write_daily_report(report)
                 archiver.write_trades_csv(report)

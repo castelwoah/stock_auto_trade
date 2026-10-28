@@ -97,6 +97,17 @@ def test_report_state_kwargs():
     assert mid["current_prices"] == {"A": 1.0} and mid["market"] is st.market
     assert main_mod._daily_state_kwargs(st) == {"market": st.market, "portfolio": st.portfolio,
                                                 "risk": st.risk}
+    assert mid["extra_positions"] is None
+
+
+def test_midday_kwargs_include_shadow_positions():
+    from src.reporting.models import MarketSummary, PortfolioState, PositionSnapshot, RiskStatus, ShadowSummary
+    from src.runtime import ReportState
+
+    pos = PositionSnapshot(symbol="A", qty=1, avg_price=10.0, current_price=11.0)
+    st = ReportState(market=MarketSummary(), portfolio=PortfolioState(), risk=RiskStatus(), cash=0.0,
+                     shadow=ShadowSummary(positions=[pos]))
+    assert main_mod._midday_state_kwargs(st)["extra_positions"] == [pos]
 
 
 def test_daily_report_uses_runtime_state(patched, monkeypatch):

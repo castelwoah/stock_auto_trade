@@ -329,3 +329,29 @@ def test_ops_section_absent_when_empty():
     r = _full_report()
     assert "■ 운영" not in render_text(r)
     assert all(f["name"] != "■ 운영" for f in render_embed(r)["fields"])
+
+
+def _shadow(**over):
+    from src.reporting.models import PositionSnapshot, ShadowSummary
+    kw = dict(buys=3, sells={"손절": 1, "EOD": 2}, realized_pnl_krw=-12_345.6,
+              positions=[PositionSnapshot(symbol="A", name="에이", qty=2, avg_price=100.0,
+                                          current_price=103.0, unrealized_pnl_pct=3.0)])
+    kw.update(over)
+    return ShadowSummary(**kw)
+
+
+def test_render_shadow_section_text_and_embed():
+    r = _full_report(shadow=_shadow())
+    txt = render_text(r)
+    assert "■ 섀도 가상 매매 (즉시 체결 가정)" in txt
+    assert "  - 매수 3건 · 매도 3건 (EOD 2, 손절 1)" in txt
+    assert "  - 실현손익(비용 반영): -12,346원" in txt
+    assert "  - 보유: 에이 2주 (+3.0%)" in txt
+    field = next(f for f in render_embed(r)["fields"] if f["name"] == "■ 섀도 가상 매매")
+    assert field["value"].startswith("- 매수 3건")
+
+
+def test_render_shadow_leftover_warning_and_absent():
+    txt = render_text(_full_report(shadow=_shadow(open_after_eod=["에이 2주"])))
+    assert "⚠ 마감 후 미청산: 에이 2주 — 청산 경로 확인 필요" in txt and "보유:" not in txt
+    assert "섀도 가상 매매" not in render_text(_full_report())

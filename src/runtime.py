@@ -4,6 +4,8 @@
   - DB 세션 1개 (tick 마다 commit, 일과 종료 시 close)
   - RiskEngine (start_equity = 09:00 평가액 고정 — D7, 투입 상한 = start × MAX_DEPLOY_PCT)
     섀도 모드 + SHADOW_CAPITAL_KRW 이면 평가액·현금은 가상 자본 기준 (실계좌 조회는 계속)
+  - ShadowBook (섀도 모드만): 섀도 기록으로 가상 포지션 재구성 → 청산 신호까지 섀도로 실행,
+    가상 보유 종목은 감시 종목에서 빠져도 시세를 계속 받는다
   - StrategyRegistry (당일 실행 signal_id 를 DB 에서 복원 — 재시작 중복 차단)
   - OrderManager (당일 미종결 주문을 DB 에서 복원)
   - 시장 데이터: 전일 OHLC·20일 평균 거래대금(09:00), 시세·종목 상태(매 tick)
@@ -32,6 +34,7 @@ from src.execution.order_manager import OrderManager
 from src.execution.pipeline import TickContext, TradingPipeline
 from src.execution.portfolio import LivePortfolio
 from src.execution.reconciler import Reconciler
+from src.execution.shadow_book import SHADOW_BOOK_SINCE, ShadowBook
 from src.persistence.db import get_session_factory
 from src.risk.blacklist import (
     CAUTION,
@@ -45,7 +48,7 @@ from src.risk.blacklist import (
 from src.risk.limits import DAILY_LOSS_LIMIT_PCT, CircuitBreakerState, DailyLossState, RiskEngine
 from src.risk.market_state import MarketState
 from src.persistence.models import RiskEvent
-from src.reporting.models import MarketSummary, PortfolioState, RiskStatus
+from src.reporting.models import MarketSummary, PortfolioState, RiskStatus, ShadowSummary
 from src.scheduler.watchlist import build_initial_watchlist, symbols_of
 from src.strategy.breakout import compute_target_price
 from src.strategy.breakout import BreakoutStrategy
@@ -72,6 +75,7 @@ class ReportState:
     risk: RiskStatus
     cash: float
     prices: dict[str, float] = field(default_factory=dict)
+    shadow: ShadowSummary | None = None      # 섀도 가상 매매 (SHADOW_MODE 일 때만)
 
 
 def quote_blacklist_entry(q: Quote) -> BlacklistEntry | None:
@@ -115,6 +119,7 @@ class TradingRuntime:
         symbols: list[str] | None = None,
         reconcile_sleep: Callable[[float], None] | None = None,
         universe_builder: Callable[[datetime], Universe] | None = None,
+        shadow_since: datetime = SHADOW_BOOK_SINCE,
     ) -> None:
         self.settings = settings
         self.kis = kis
@@ -130,6 +135,8 @@ class TradingRuntime:
         self._reconcile_sleep = reconcile_sleep
         self.session: Session | None = None
         self.pipeline: TradingPipeline | None = None
+        self.shadow_book: ShadowBook | None = None
+        self._shadow_since = shadow_since
         self.prepared_for: date | None = None
         self.prev_day_ohlc: dict[str, dict[str, float]] = {}
         self.avg_trade_value: dict[str, float] = {}
@@ -186,11 +193,13 @@ class TradingRuntime:
         )
         restored = orders.restore_open_orders(portfolio.open_trades(day_start, day_end))
 
+        self.shadow_book = ShadowBook(self.session, since=self._shadow_since) if self.settings.SHADOW_MODE else None
         self.pipeline = TradingPipeline(
             registry=registry, risk_engine=risk, order_manager=orders,
             portfolio=portfolio, reconciler=reconciler,
             kill_switch=self.settings.kill_switch_on,
             deploy_slots=self.settings.MAX_DEPLOY_SLOTS,
+            shadow_book=self.shadow_book,
         )
         if not recon.ok:
             self.pipeline.set_trading_off(True, reason=f"reconcile mismatch: {recon.detail}")
@@ -217,6 +226,9 @@ class TradingRuntime:
             f"감시 종목: {self._universe_label()}",
             f"Reconcile: {'OK' if recon.ok else 'MISMATCH → 매매 OFF: ' + recon.detail}",
         ]
+        if self.shadow_book is not None:
+            held = self._shadow_held()
+            lines.append(f"섀도 가상 보유: {len(held)}종목" + (f" ({', '.join(sorted(held))})" if held else ""))
         if not self.settings.SHADOW_MODE and self.settings.SHADOW_CAPITAL_KRW is not None:
             lines.append("⚠️ SHADOW_CAPITAL_KRW 무시됨 — 실주문 모드는 실계좌 기준")
         if late:
@@ -246,18 +258,18 @@ class TradingRuntime:
         universe = self._active_universe()
         active = set(universe.symbols) if universe is not None else set(self.symbols)
         compare = set(self.symbols) if self._comparing(universe) else set()
-        held = {p.symbol for p in self.pipeline.portfolio.iter_open_positions()}
+        held = {p.symbol for p in self.pipeline.portfolio.iter_open_positions()} | self._shadow_held()
         self._ensure_daily_data(active | compare)
         quotes = self._fetch_quotes(sorted(active | held | compare))
         self._apply_market_state(quotes)
         tradable = {s: q for s, q in quotes.items() if s in active or s in held}
 
         cash, equity, stale = self._read_account()
+        self._report_prices = {s: q.price for s, q in quotes.items()}
         virtual = self.settings.shadow_capital()
         if virtual is not None:
             cash, equity = self._virtual_account(virtual, now.date())
         self._report_cash, self._report_equity = cash, equity
-        self._report_prices = {s: q.price for s, q in quotes.items()}
         ctx = TickContext(
             as_of=now,
             cash_available=cash,
@@ -372,6 +384,7 @@ class TradingRuntime:
                 self.session.close()
         self.session = None
         self.pipeline = None
+        self.shadow_book = None
         self.prepared_for = None
 
     def notify_error(self, where: str, exc: BaseException) -> None:
@@ -431,7 +444,7 @@ class TradingRuntime:
         cash = self._report_cash if self._report_cash is not None else (self._last_cash or 0.0)
         virtual = self.settings.shadow_capital()
         if virtual is not None and self.prepared_for is not None:
-            cash, equity = self._virtual_account(virtual, self.prepared_for)   # tick 이후 섀도 매수 반영
+            cash, equity = self._virtual_account(virtual, self.prepared_for)   # tick 이후 섀도 매매 반영
         pnl = equity - dl.start_equity
         return ReportState(
             market=MarketSummary(kospi=kospi[0], kospi_change_pct=kospi[1],
@@ -449,15 +462,39 @@ class TradingRuntime:
             ),
             cash=cash,
             prices=dict(self._report_prices),
+            shadow=self._shadow_summary(),
         )
 
     def _virtual_account(self, capital: float, day: date) -> tuple[float, float]:
-        """섀도 가상 자본: (현금 = 자본 − 당일 섀도 매수액, 평가액 = 자본)."""
+        """섀도 가상 자본: ShadowBook 이 있으면 (자본 − 보유 원가 + 당일 실현손익, 현금 + 보유 평가액),
+        없으면 이전 방식 (현금 = 자본 − 당일 섀도 매수액, 평가액 = 자본)."""
         assert self.pipeline is not None
+        if self.shadow_book is not None:
+            return self.shadow_book.account(capital, day, self._report_prices)
         spent = sum(self.pipeline.portfolio.shadow_buy_notional(
             datetime.combine(day, time.min), datetime.combine(day, time(23, 59, 59)),
         ).values())
         return max(capital - spent, 0.0), capital
+
+    def _shadow_held(self) -> set[str]:
+        if self.shadow_book is None:
+            return set()
+        try:
+            return self.shadow_book.held_symbols()
+        except Exception:
+            logger.exception("shadow book read failed — virtual holdings not quoted this tick")
+            return set()
+
+    def _shadow_summary(self) -> ShadowSummary | None:
+        if self.shadow_book is None or self.prepared_for is None:
+            return None
+        try:
+            names = {s: self.symbol_name(s) for s in self.shadow_book.held_symbols()}
+            return self.shadow_book.summary(self.prepared_for, self._report_prices,
+                                            as_of=self._now(), names=names)
+        except Exception:
+            logger.exception("shadow summary failed")
+            return None
 
     def _read_equity(self) -> float:
         _, evaluation = self.kis.get_stock_balance()

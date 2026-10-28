@@ -103,7 +103,7 @@ def _rt(factory, kis=None, clock=None, tmp_path=None, **settings_over):
     rt = TradingRuntime(
         make_settings(**settings_over), kis or FakeKis(), FakeNotifier(),
         session_factory=factory, now_provider=lambda: clock[0], symbols=[SYM],
-        reconcile_sleep=lambda s: None,
+        reconcile_sleep=lambda s: None, shadow_since=datetime(2026, 1, 1),
     )
     return rt, clock
 
@@ -160,7 +160,7 @@ def test_shadow_capital_cash_reduced_by_shadow_buys_after_restart(factory, tmp_p
     rt2, _ = _rt(factory, kis, clock=clock, tmp_path=tmp_path, SHADOW_CAPITAL_KRW=10_000_000)
     rt2.prepare()
     cash, equity = rt2._virtual_account(10_000_000, clock[0].date())
-    assert (cash, equity) == (10_000_000 - 2 * 72_000, 10_000_000)
+    assert (cash, equity) == (10_000_000 - 2 * 72_000, 10_000_000)   # 현금 + 가상 보유 2주 × 72,000
 
 
 def test_small_account_without_shadow_capital_skips_unaffordable(factory, tmp_path, caplog):
@@ -591,3 +591,38 @@ def test_builder_failure_falls_back_to_watchlist(factory, tmp_path):
     assert rt.universe is None and rt.active_symbols() == [SYM]
     clock[0] = datetime(2026, 10, 20, 9, 10)
     assert rt.tick() == 1
+
+
+def test_shadow_virtual_holding_quoted_and_liquidated_at_eod(factory, tmp_path):
+    """감시 종목에서 빠진 가상 보유도 시세를 받아 15:15 에 섀도 청산된다."""
+    other = "000660"
+    with factory() as s:
+        s.add(Trade(ts=datetime(2026, 10, 20, 9, 30), symbol=other, side="BUY", qty=3, price=100_000,
+                    strategy_id="breakout", idempotency_key="seed-other", status="shadow"))
+        s.commit()
+    kis = FakeKis()
+    kis.equity, kis.cash = 48_000.0, 40_875
+    kis.quotes[other] = _quote(other, price=103_000.0)
+    rt, clock = _rt(factory, kis, tmp_path=tmp_path, SHADOW_CAPITAL_KRW=10_000_000)
+    rt.prepare()
+    assert "섀도 가상 보유: 1종목 (000660)" in rt.notifier.sent[-1]
+    cash, equity = rt._virtual_account(10_000_000, clock[0].date())
+    assert cash == 10_000_000 - 300_000
+    clock[0] = datetime(2026, 10, 20, 15, 15)
+    rt.tick()
+    sells = [t for t in _trades(factory) if t.side == "SELL"]
+    assert [(t.symbol, t.qty, t.price, t.status, t.note) for t in sells] == [
+        (other, 3, 103_000, "shadow", "eod_liquidation")]
+    assert kis.orders == [] and rt.shadow_book.open_positions() == {}
+    clock[0] = datetime(2026, 10, 20, 16, 0)
+    st = rt.report_state()
+    assert st.shadow.sells == {"EOD": 1} and st.shadow.open_after_eod == []
+    assert st.shadow.realized_pnl_krw > 0
+    assert st.portfolio.total_value == pytest.approx(10_000_000 + st.shadow.realized_pnl_krw)
+
+
+def test_live_mode_has_no_shadow_book(factory, tmp_path):
+    rt, _ = _rt(factory, tmp_path=tmp_path, SHADOW_MODE=False)
+    rt.prepare()
+    assert rt.shadow_book is None and rt.pipeline.shadow_book is None
+    assert rt.report_state().shadow is None

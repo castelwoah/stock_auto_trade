@@ -516,9 +516,11 @@ class _Spy(Strategy):
     def __init__(self):
         super().__init__()
         self.extras = None
+        self.positions = None
 
     def decide_entries(self, ctx):
         self.extras = ctx.extras
+        self.positions = ctx.positions
         return []
 
     def decide_exits(self, ctx):
@@ -568,3 +570,111 @@ def test_breakout_with_budget_buys_affordable_symbol(session):
     ))
     assert [s.symbol for s in executed] == ["CHEAP"]
     assert kis.order.call_count == 0                                            # shadow
+
+
+# --- 섀도 가상 포지션 (ShadowBook) -------------------------------------------
+
+def _shadow_breakout(session, clock, *, cap=500_000):
+    from src.execution.shadow_book import ShadowBook
+    from src.strategy.breakout import BreakoutStrategy
+
+    kis = _kis()
+    lp = LivePortfolio(session)
+    reg = StrategyRegistry()
+    reg.register(BreakoutStrategy(), allocation_pct=20)
+    om = OrderManager(kis_client=kis, portfolio=lp, now_provider=lambda: clock[0], shadow=True)
+    book = ShadowBook(session, since=datetime(2026, 1, 1))
+    pipe = TradingPipeline(registry=reg, risk_engine=_risk(capital_cap_krw=cap), order_manager=om,
+                           portfolio=lp, reconciler=Reconciler(session, kis), deploy_slots=3,
+                           shadow_book=book)
+    return pipe, book, kis
+
+
+# 목표가 = 9,500 + (9,900 − 9,000) × 0.5 = 9,950 → 10,000 돌파
+CHEAP_OHLC = {"CHEAP": {"open_today": 9_500, "high": 9_900, "low": 9_000}}
+
+
+def _btick(clock, price, **over):
+    kw = dict(as_of=clock[0], cash_available=10_000_000, current_prices={"CHEAP": price},
+              prev_day_ohlc=CHEAP_OHLC, liquidity={"CHEAP": LIQ["A"]})
+    kw.update(over)
+    return TickContext(**kw)
+
+
+def _shadow_rows(session):
+    from src.persistence.models import Trade
+    return [(t.side, t.qty, t.price, (t.note or "").split(":")[0])
+            for t in session.query(Trade).order_by(Trade.id).all()]
+
+
+def test_shadow_stop_loss_sells_virtual_position(session):
+    clock = [datetime(2026, 10, 29, 10, 0)]
+    pipe, book, kis = _shadow_breakout(session, clock)
+    assert [s.action for s in pipe.run_tick(_btick(clock, 10_000))] == [Action.BUY]
+    clock[0] = datetime(2026, 10, 29, 10, 5)
+    assert [s.action for s in pipe.run_tick(_btick(clock, 9_400))] == [Action.SELL]   # −6%
+    rows = _shadow_rows(session)
+    assert rows[0][:3] == ("BUY", 16, 10_000)                                  # 166,666 ÷ 10,000
+    assert rows[1] == ("SELL", 16, 9_400, "stop_loss")                         # 현재가 기록 (−1% 아님)
+    assert book.open_positions() == {} and kis.order.call_count == 0
+
+
+def test_shadow_eod_liquidation(session):
+    clock = [datetime(2026, 10, 29, 10, 0)]
+    pipe, book, _ = _shadow_breakout(session, clock)
+    pipe.run_tick(_btick(clock, 10_000))
+    clock[0] = datetime(2026, 10, 29, 15, 15)
+    pipe.run_tick(_btick(clock, 10_100))
+    assert _shadow_rows(session)[-1] == ("SELL", 16, 10_100, "eod_liquidation")
+    assert book.open_positions() == {}
+
+
+def test_shadow_trailing_stop_after_peak(session):
+    clock = [datetime(2026, 10, 29, 10, 0)]
+    pipe, _, _ = _shadow_breakout(session, clock)
+    pipe.run_tick(_btick(clock, 10_000))
+    clock[0] = datetime(2026, 10, 29, 10, 5)
+    assert pipe.run_tick(_btick(clock, 10_800)) == []                          # +8% → Trailing 무장
+    clock[0] = datetime(2026, 10, 29, 10, 10)
+    pipe.run_tick(_btick(clock, 10_450))                                       # 고점 대비 −3.2%
+    assert _shadow_rows(session)[-1] == ("SELL", 16, 10_450, "trailing_stop")
+
+
+def test_shadow_virtual_holding_counts_toward_cap_until_sold(session):
+    from src.execution.shadow_book import ShadowBook
+    from src.persistence.models import RiskEvent
+
+    _seed_shadow_buy(session, symbol="B", qty=300, ts=datetime(2026, 4, 17, 10))   # 전날 보유 이월
+    book = ShadowBook(session, since=datetime(2026, 1, 1))
+    pipe = _pipe(session, risk=_risk(capital_cap_krw=300_000), shadow=True)
+    pipe.shadow_book = book
+    liq = {"A": LIQ["A"], "B": LIQ["A"]}
+    assert pipe.run_tick(_tick(current_prices={"A": 1000, "B": 1000}, liquidity=liq)) == []
+    assert session.query(RiskEvent).filter_by(event_type="risk_blocked").one().action_taken == "capital_cap"
+    from src.persistence.models import Trade
+    session.add(Trade(ts=datetime(2026, 4, 20, 9, 50), symbol="B", side="SELL", qty=300, price=1000,
+                      strategy_id="test_buy", idempotency_key="seed-sell", status="shadow"))
+    session.flush()
+    assert len(pipe.run_tick(_tick(current_prices={"A": 1000, "B": 1000}, liquidity=liq))) == 1
+
+
+def test_shadow_book_failure_blocks_entries_only(session, caplog):
+    book = MagicMock()
+    book.update_peaks.side_effect = RuntimeError("db")
+    pipe = _pipe(session, shadow=True)
+    pipe.shadow_book = book
+    assert pipe.run_tick(_tick()) == []
+    assert "shadow book read failed" in caplog.text
+
+
+def test_real_position_takes_priority_over_virtual(session):
+    from src.execution.shadow_book import ShadowBook
+    from src.persistence.models import Position
+
+    session.add(Position(symbol="A", strategy_id="test_buy", qty=7, avg_price=900.0))
+    _seed_shadow_buy(session, symbol="A", qty=300)
+    spy = _Spy()
+    pipe = _pipe(session, strategy=spy, shadow=True)
+    pipe.shadow_book = ShadowBook(session, since=datetime(2026, 1, 1))
+    pipe.run_tick(_tick())
+    assert spy.positions["A"].qty == 7

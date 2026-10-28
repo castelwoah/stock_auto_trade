@@ -12,6 +12,8 @@ v4:
   - risk_blocked 기록은 (날짜, 종목, 전략, 사유) 당 1회 — 같은 신호가 tick 마다 반복돼도 1건
   - 같은 한도를 tick 시작 시 extras["max_entry_notional"] 로 전략에 넘긴다 — 전략은 1주도
     못 사는 종목을 후보에서 빼고 다음 순위로 자리를 채운다 (비싼 상위 종목이 슬롯을 막지 않게)
+  - 섀도 모드 + shadow_book: 섀도 기록으로 만든 가상 포지션을 전략에 넘겨 청산 신호까지 섀도로
+    실행하고, 투입액도 가상 보유 평가액으로 계산한다. 가상 포지션을 못 읽으면 그 tick 매수만 차단
 """
 from __future__ import annotations
 
@@ -28,6 +30,7 @@ from src.clients.kis import KisClient
 from src.execution.order_manager import OrderManager
 from src.execution.portfolio import LivePortfolio
 from src.execution.reconciler import Reconciler
+from src.execution.shadow_book import ShadowBook
 from src.persistence.models import RiskEvent
 from src.risk.exceptions import RiskBlocked
 from src.risk.limits import BuyContext, RiskEngine, set_risk_engine
@@ -79,6 +82,7 @@ class TradingPipeline:
         strategy_ver: str = "v1.0",
         kill_switch: KillSwitch | None = None,
         deploy_slots: int | None = None,
+        shadow_book: ShadowBook | None = None,
     ) -> None:
         self.registry = registry
         self.risk = risk_engine
@@ -88,6 +92,8 @@ class TradingPipeline:
         self.strategy_ver = strategy_ver
         self.kill_switch = kill_switch
         self.deploy_slots = deploy_slots
+        self.shadow_book = shadow_book
+        self._shadow_notional: dict[str, float] = {}
         self._blocks_seen: set[tuple[date, str, str, str]] = set()
         self._trading_off = False
         self._trading_off_reason: str | None = None
@@ -132,6 +138,18 @@ class TradingPipeline:
             logger.warning("new entries blocked this tick: %s", ctx.block_entries_reason)
             entries_allowed = False
         positions_state = self.portfolio.positions_as_state(current_prices=ctx.current_prices)
+        if self.shadow_book is not None:
+            try:
+                self.shadow_book.update_peaks(ctx.current_prices)
+                virtual = self.shadow_book.positions_as_state(ctx.current_prices)
+                self._shadow_notional = self.shadow_book.open_notional(ctx.current_prices)
+            except Exception:
+                # 가상 보유를 모르면 투입액이 과소 계산된다 → 이번 tick 매수만 막는다
+                logger.exception("shadow book read failed — new entries blocked this tick")
+                virtual, self._shadow_notional = {}, {}
+                entries_allowed = False
+            for sym, st in virtual.items():
+                positions_state.setdefault(sym, st)      # 실포지션 우선
         today = ctx.as_of.date()
         extras = dict(ctx.extras)
         budget = self._entry_budget(ctx) if entries_allowed else None
@@ -281,8 +299,12 @@ class TradingPipeline:
         # 미체결 매수 주문도 투입액으로 본다 (상한·종목 20% 계산이 체결 전에 새지 않도록)
         for sym, amount in self.orders.pending_buy_notional().items():
             existing[sym] = existing.get(sym, 0.0) + amount
-        # 섀도 모드: 송신하지 않은 당일 매수도 투입액으로 본다 (상한이 실전처럼 소진되도록)
-        if self.orders.shadow is True:
+        # 섀도 모드: 가상 보유 평가액을 투입액으로 본다 (팔면 상한·슬롯이 실전처럼 비워진다)
+        if self.shadow_book is not None:
+            for sym, amount in self._shadow_notional.items():
+                existing[sym] = existing.get(sym, 0.0) + amount
+        # shadow_book 없는 섀도 모드(이전 방식): 송신하지 않은 당일 매수를 투입액으로 본다
+        elif self.orders.shadow is True:
             d = ctx.as_of.date()
             for sym, amount in self.portfolio.shadow_buy_notional(
                 datetime.combine(d, time.min), datetime.combine(d, time(23, 59, 59)),
