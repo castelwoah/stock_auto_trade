@@ -516,7 +516,7 @@ W8 (모의투자)   → 단일 세션 (관찰·튜닝)
     - **ops**: systemd/cron 템플릿화(`@PROJECT_ROOT@` 등) + `scripts/_ops_common.sh` 렌더 + `systemd-analyze verify` 통과. runbook 에 실전 운용 스위치 표.
     - **테스트**: 477 → **652 pass**, 전체 커버리지 91% (kis 98% / execution 96~100% / runtime 96% / risk 100%).
 - **스모크 테스트 스크립트** `scripts/smoke_live.py` (runbook §1.2) — 아래 가정값을 R1·R2·O2·O3 로 판정. 원주문 행 `cncl_yn`(수동취소 감지 근거)도 함께 확인.
-- **확인 필요 (실전 스모크 테스트)**: `hts_avls` 단위(억원 가정), `vi_cls_code` 값 체계, `mrkt_warn_cls_code` 01/02/03 의미, 체결조회 `ord_gno_brno` = 주문 응답 `KRX_FWDG_ORD_ORGNO` 가정, 실전 초당 한도.
+- **확인 필요 (실전 스모크 테스트)**: ~~`hts_avls` 단위(억원 가정)~~ · ~~체결조회 `ord_gno_brno` = 주문 응답 `KRX_FWDG_ORD_ORGNO` 가정~~ (10-28 확인), `vi_cls_code` 값 체계, `mrkt_warn_cls_code` 01/02/03 의미, 실전 초당 한도.
 - **알려진 제약(Phase A)**: 섀도 모드의 매수는 미체결 추적을 하지 않아 상한 계산이 실전보다 느슨함. 하한가 근처 매도는 가격제한폭 거절 가능(재시도 5회 후 수동 대응). Circuit Breaker 의 연속 손실일 입력(`DailyPnl` 기록)은 Phase B.
 
 ### 2026-10-23
@@ -556,6 +556,9 @@ W8 (모의투자)   → 단일 세션 (관찰·튜닝)
 - **발견 (10-27 슬롯 분할의 부작용)**: 종목당 한도 16.7만 < SK하이닉스 137.1만 · 삼성전자 23.05만 · NAVER 18.35만. breakout 은 뉴스 점수 상위 3개를 살 수 있는지와 무관하게 고르므로, 돌파 20종목 중 이 3종목이 매 tick 자리를 차지 → 섀도 매수 0건 (qty_zero 3건, 1일 1회 기록은 정상).
 - **수정 A (사용자 승인)**: pipeline 이 tick 시작 시 매수 1건 한도 `min(상한 잔여, 상한 ÷ MAX_DEPLOY_SLOTS)` 를 `extras["max_entry_notional"]` 로 전략에 전달(`_clip_to_capital_cap` 과 같은 식, 투입액 계산은 `_existing_notional` 로 공용화). breakout 은 1주 가격 > min(현금 배분, 한도) 인 종목을 후보에서 빼고 다음 순위로 채움 — 정렬 규칙·신호별 최종 축소·리스크 게이트는 그대로. 건너뜀은 종목·일 1회 INFO 로그. 키가 없으면(백테스트·상한 없음) 기존 동작. news_swing 은 배분 0% 라 미적용.
 - 테스트 819 → **830 pass** (breakout 100%, pipeline 96%).
+- **실전 스모크 테스트 (사용자 승인)**: 읽기 전용 10:07 PASS 6 / WARN 1 — `hts_avls` **억원 확인**. 실주문 11:33 카카오(035720) 1주 @27,350(−10%) 매수 → 취소, PASS 10 / WARN 1 / FAIL 0 — 체결조회 `ord_gno_brno` = 주문 응답 `KRX_FWDG_ORD_ORGNO` **확인**, 체결 0·잔량 0.
+- **발견·수정 — 수동취소 미감지**: 실전 원주문 행은 취소 뒤에도 `cncl_yn` 이 빈 값 → `cncl_yn=='Y'` 가정으로는 HTS 수동취소를 못 알아채 주문이 열린 채 남음(매수는 상한 점유, 매도는 재매도 안 됨, 취소 재시도 실패 알림). 봇 자체 취소는 취소 API 결과로 판단해 영향 없음. `kis._parse_fill` 이 `cncl_yn=='Y'` **또는 잔량 0 · 체결 < 주문수량** 이면 취소로 판정. 10-28 원문으로 회귀 테스트.
+- 테스트 830 → **835 pass**. 남은 확인: `mrkt_warn_cls_code` 01/02/03 · `vi_cls_code` 발동 원값(해당 종목 발생 시), 실전 초당 한도(R5).
 
 ## Notes
 

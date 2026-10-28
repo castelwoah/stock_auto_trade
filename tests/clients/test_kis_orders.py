@@ -152,9 +152,32 @@ def test_inquire_today_orders_error(live_client, http):
         live_client.inquire_today_orders("20261020")
 
 
+# 10-28 실전 원문 (카카오 1주 매수 → 취소): 원주문 행·취소 행 모두 cncl_yn 빈 값
+LIVE_CANCELLED_ORIG = {"odno": "0012060000", "orgn_odno": "", "pdno": "035720", "sll_buy_dvsn_cd": "02",
+                       "ord_qty": "1", "tot_ccld_qty": "0", "rmn_qty": "0", "cncl_yn": "",
+                       "cncl_cfrm_qty": "0", "rjct_qty": "0", "avg_prvs": "0", "ord_gno_brno": "91250"}
+LIVE_OPEN = {**LIVE_CANCELLED_ORIG, "rmn_qty": "1"}
+
+
+def test_parse_fill_live_cancel_without_cncl_yn():
+    f = kis_mod._parse_fill(LIVE_CANCELLED_ORIG)
+    assert f.cancelled and f.filled_qty == 0 and f.remaining_qty == 0 and f.orgno == "91250"
+    assert not kis_mod._parse_fill(LIVE_OPEN).cancelled
+
+
+@pytest.mark.parametrize("filled,rmn,cncl,expected", [
+    (10, 0, "", False),      # 전량 체결
+    (4, 0, "", True),        # 부분 체결 후 잔량 취소
+    (4, 6, "", False),       # 부분 체결 진행 중
+    (4, 6, "Y", True),       # cncl_yn 이 오는 경우도 계속 인정
+])
+def test_parse_fill_cancel_inference(filled, rmn, cncl, expected):
+    assert kis_mod._parse_fill(_row("1", filled, rmn, cncl=cncl)).cancelled is expected
+
+
 def test_parse_fill_handles_garbage():
     f = kis_mod._parse_fill({"odno": "9", "tot_ccld_qty": "x", "avg_prvs": None})
-    assert f.filled_qty == 0 and f.avg_price == 0.0
+    assert f.filled_qty == 0 and f.avg_price == 0.0 and not f.cancelled   # ord_qty 없음 → 판단 안 함
 
 
 # --- quotes ------------------------------------------------------------------

@@ -87,8 +87,8 @@ class OrderFill:
     avg_price: float
     remaining_qty: int
     cancelled: bool
-    # 주문채번지점번호 — 주문 응답의 KRX_FWDG_ORD_ORGNO 와 같은 값으로 가정
-    # (응답 유실 주문을 체결조회로 복구해 취소할 때 사용. 실전 스모크 테스트에서 확인)
+    # 주문채번지점번호 — 주문 응답의 KRX_FWDG_ORD_ORGNO 와 같은 값 (10-28 실전 스모크 테스트 확인).
+    # 응답 유실 주문을 체결조회로 복구해 취소할 때 사용
     orgno: str = ""
 
 
@@ -616,14 +616,20 @@ def _parse_fill(r: dict[str, Any]) -> OrderFill:
         avg = float(r.get("avg_prvs") or 0)
     except (TypeError, ValueError):
         avg = 0.0
+    ord_qty = _to_int(r.get("ord_qty"))
+    filled = _to_int(r.get("tot_ccld_qty"))
+    remaining = _to_int(r.get("rmn_qty"))
+    # 실전 원주문 행은 취소 뒤에도 cncl_yn 이 빈 값 (10-28 스모크 테스트) —
+    # 잔량 0 인데 전량 체결이 아니면 취소(또는 거절)로 끝난 주문으로 본다
+    cancelled = r.get("cncl_yn") == "Y" or (ord_qty > 0 and remaining == 0 and filled < ord_qty)
     return OrderFill(
         odno=str(r.get("odno") or ""),
         symbol=str(r.get("pdno") or ""),
         side="SELL" if r.get("sll_buy_dvsn_cd") == "01" else "BUY",
-        ord_qty=_to_int(r.get("ord_qty")),
-        filled_qty=_to_int(r.get("tot_ccld_qty")),
+        ord_qty=ord_qty,
+        filled_qty=filled,
         avg_price=avg,
-        remaining_qty=_to_int(r.get("rmn_qty")),
-        cancelled=(r.get("cncl_yn") == "Y"),
+        remaining_qty=remaining,
+        cancelled=cancelled,
         orgno=str(r.get("ord_gno_brno") or ""),
     )

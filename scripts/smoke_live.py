@@ -276,7 +276,7 @@ def _cancel_and_confirm(kis: KisClient, rec: RawRecorder, rep: Report, ack, day:
     for c in children:
         rep.add("O3", INFO, "취소 행", **_pick(c, keys))
     rep.add("O3", INFO,
-            "수동취소 감지(OrderFill.cancelled)는 원주문 행 cncl_yn=='Y' 를 가정 — 위 원값으로 확인")
+            "수동취소 감지(OrderFill.cancelled)는 cncl_yn=='Y' 또는 잔량 0·체결<주문수량 — 위 원값으로 확인")
 
 
 # ---------------------------------------------------------------------------

@@ -56,7 +56,13 @@
 | R1 | `hts_avls` 단위가 억원 | `get_quote` 환산 계수 수정 전까지 유동성 게이트 신뢰 불가 |
 | R2 | 종목상태 원값 (`vi_cls_code`·`mrkt_warn_cls_code` 등) | 발동 종목 원값으로 `get_quote` 판정식 확인 |
 | O2 | 체결조회 `ord_gno_brno` = 주문 응답 `KRX_FWDG_ORD_ORGNO` | 응답 유실 주문의 자동 취소 불가 — 수정 전 실주문 보류 |
-| O3 | 취소 후 원주문 행 `rmn_qty`·`cncl_yn` | 수동취소 감지 가정(`cncl_yn=='Y'`) 재검토 |
+| O3 | 취소 후 원주문 행 `rmn_qty`·`cncl_yn` | 수동취소 감지 판정식(`kis._parse_fill`) 재검토 |
+
+**실행 결과 (2026-10-28, 카카오 1주 @27,350 → 취소)** — PASS 10 / WARN 1(외부 보유 036630) / FAIL 0.
+R1 억원 확인 · O2 일치(91250) · O3 원주문 행 `tot_ccld_qty 0`·`rmn_qty 0`, 단 **`cncl_yn` 은 취소 뒤에도 빈 값**
+(원주문·취소 행 모두, `cncl_cfrm_qty` 도 0). 그래서 수동취소는 "잔량 0 · 체결 < 주문수량" 으로 판정한다.
+R2 의 경고·VI 발동 원값과 R5 는 미확인. 주문가는 주문가능현금 이하여야 하므로 소액 계좌는 `--symbol` 로 저가 종목 지정
+(예: `--symbol 035720 --order --max-krw 40000`).
 
 - `--order` 는 `SHADOW_MODE: true` 일 때만 동작한다 (데몬 실주문과 겹침 방지). OrderManager·DB 를 거치지 않는다.
 - 취소 실패(`O3 FAIL 취소 실패`) 또는 체결(`체결됨`)이 나오면 HTS/MTS 에서 해당 주문을 직접 취소·매도한다.
