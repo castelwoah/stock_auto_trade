@@ -22,7 +22,7 @@
 | `SHADOW_MODE` | `true` | 전 파이프라인·리스크 게이트를 돌리되 **KIS 주문 송신만 생략** (`Trade.status='shadow'`). 실주문은 `false` 로 바꾸고 재시작 |
 | `SHADOW_CAPITAL_KRW` | 없음 | 섀도 모드 전용 **가상 자본**(원). 매수 금액·투입 상한·일일 손실 기준을 실계좌 대신 이 값으로 계산(실계좌 조회·Reconcile 은 그대로). 당일 섀도 매수는 투입액으로 누적. `SHADOW_MODE: false` 면 무시 |
 | `MAX_DEPLOY_PCT` | `5.0` | 09:00 평가액 대비 **전체 투입 상한** %. 미체결 매수 포함, 초과 매수는 `capital_cap` 차단. 금액이 1주 가격보다 작으면 `qty_zero` 로 기록 (종목·사유별 하루 1건) |
-| `MAX_DEPLOY_SLOTS` | `3` | 매수 1건 금액 ≤ 투입 상한 ÷ 슬롯 수 — 첫 종목이 상한을 다 쓰지 않게 (예: 상한 50만 → 종목당 ≤16.7만). 이보다 비싼 종목은 `qty_zero` |
+| `MAX_DEPLOY_SLOTS` | `3` | 매수 1건 금액 ≤ 투입 상한 ÷ 슬롯 수 — 첫 종목이 상한을 다 쓰지 않게 (예: 상한 50만 → 종목당 ≤16.7만). 1주 가격이 이보다 비싼 종목은 breakout 후보에서 빠지고 다음 순위로 채운다 (로그 `skip unaffordable`) |
 | `TRADING_DISABLED` | `false` | 킬 스위치 (재시작 필요) |
 | `KILL_SWITCH_FILE` | `run/TRADING_DISABLED` | **파일이 존재하면 즉시 신규 매수 차단** (재시작 불필요, 청산은 계속) |
 | `ALLOC_BREAKOUT_PCT` / `ALLOC_NEWS_SWING_PCT` | `20` / `0` | 전략별 현금 배분 % |

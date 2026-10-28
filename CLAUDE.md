@@ -62,7 +62,7 @@ mini_project/
 │   ├── strategy/           # W5 신설
 │   │   ├── base.py          # Signal / Action enum / Strategy ABC / PositionState / StrategyContext
 │   │   ├── exit_signals.py  # SL -5% / TP +7% arm / Trailing -3% / event_exit / evaluate_exit / update_peak
-│   │   ├── breakout.py      # 변동성 돌파 legacy 포팅, 15:00 매수 중단 / 15:15 EOD 청산, 빈 자리는 뉴스 점수→돌파율 순
+│   │   ├── breakout.py      # 변동성 돌파 legacy 포팅, 15:00 매수 중단 / 15:15 EOD 청산, 빈 자리는 뉴스 점수→돌파율 순 (1주도 못 사는 종목 제외)
 │   │   ├── universe.py      # news-universe-v1: 보유 + 뉴스 후보 상위 N (+ watchlist 예비), 악재 차단, StockScore 기록
 │   │   ├── news_swing.py    # 뉴스 스코어 기반 스윙 (5~10종목, 당일 청산 없음)
 │   │   └── registry.py      # 서브포트폴리오 현금 할당 + 신호 라우팅 (D2 격리, 금지 영역)
@@ -551,6 +551,11 @@ W8 (모의투자)   → 단일 세션 (관찰·튜닝)
     - 4 장전 뉴스 브리핑 — `analysis/llm_judge.py` + `reporting/news_briefing.py`, 08:40 job(총 9 job). Claude API(`claude-haiku-5-5`, tool_use 강제 + 재검증, requests 직접 호출 — 새 의존성 없음), 키 없음·실패 시 룰 대체 표시. 정보용(매매 미반영), 08:35~09:05 윈도우, 결과·모델·프롬프트 해시·입력 기사 ID 는 `reports/briefing/*.json`(스키마 무변경), 16:00 적중 평가. `BRIEFING_ENABLED` 기본 false, `ANTHROPIC_API_KEY` 는 redact 등록 + `sk-ant-` 패턴.
 - 테스트 762 → **819 pass**. 신규 모듈 커버리지 heartbeat 100% / news_briefing 99% / llm_judge 95%, 전체 95%.
 - **사용자 작업**: 브리핑을 켜려면 `config.yaml` 에 `BRIEFING_ENABLED: true` + `ANTHROPIC_API_KEY` 추가 후 재시작(또는 다음 07:00 기동).
+
+### 2026-10-28
+- **발견 (10-27 슬롯 분할의 부작용)**: 종목당 한도 16.7만 < SK하이닉스 137.1만 · 삼성전자 23.05만 · NAVER 18.35만. breakout 은 뉴스 점수 상위 3개를 살 수 있는지와 무관하게 고르므로, 돌파 20종목 중 이 3종목이 매 tick 자리를 차지 → 섀도 매수 0건 (qty_zero 3건, 1일 1회 기록은 정상).
+- **수정 A (사용자 승인)**: pipeline 이 tick 시작 시 매수 1건 한도 `min(상한 잔여, 상한 ÷ MAX_DEPLOY_SLOTS)` 를 `extras["max_entry_notional"]` 로 전략에 전달(`_clip_to_capital_cap` 과 같은 식, 투입액 계산은 `_existing_notional` 로 공용화). breakout 은 1주 가격 > min(현금 배분, 한도) 인 종목을 후보에서 빼고 다음 순위로 채움 — 정렬 규칙·신호별 최종 축소·리스크 게이트는 그대로. 건너뜀은 종목·일 1회 INFO 로그. 키가 없으면(백테스트·상한 없음) 기존 동작. news_swing 은 배분 0% 라 미적용.
+- 테스트 819 → **830 pass** (breakout 100%, pipeline 96%).
 
 ## Notes
 

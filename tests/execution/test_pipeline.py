@@ -504,3 +504,67 @@ def test_risk_block_new_day_or_new_code_recorded(session):
     _pipe(session, risk=risk).run_tick(_tick(as_of=datetime(2026, 4, 21, 10, 5)))   # 다른 사유
     codes = sorted((e.ts.date().isoformat(), e.action_taken) for e in _blocks(session))
     assert codes == [("2026-04-20", "qty_zero"), ("2026-04-21", "blacklist"), ("2026-04-21", "qty_zero")]
+
+
+# ---------------------------------------------------------------------------
+# 매수 1건 한도를 전략에 전달 (10-28)
+# ---------------------------------------------------------------------------
+
+class _Spy(Strategy):
+    strategy_id = "test_buy"
+
+    def __init__(self):
+        super().__init__()
+        self.extras = None
+
+    def decide_entries(self, ctx):
+        self.extras = ctx.extras
+        return []
+
+    def decide_exits(self, ctx):
+        return []
+
+
+def test_entry_budget_passed_to_strategy(session):
+    spy = _Spy()
+    _pipe(session, risk=_risk(capital_cap_krw=500_000), strategy=spy, deploy_slots=3).run_tick(
+        _tick(extras={"news_scores": {"A": 70.0}}))
+    assert spy.extras["max_entry_notional"] == pytest.approx(500_000 / 3)
+    assert spy.extras["news_scores"] == {"A": 70.0}            # 기존 extras 유지
+
+
+def test_entry_budget_reflects_shadow_buys_and_positions(session):
+    _seed_position(session, strategy_id="other", qty=300, avg=1000.0)          # 300,000
+    _seed_shadow_buy(session, qty=150, price=1000.0, ts=datetime(2026, 4, 20, 9, 30))   # 150,000
+    spy = _Spy()
+    _pipe(session, risk=_risk(capital_cap_krw=500_000), strategy=spy, deploy_slots=3,
+          shadow=True).run_tick(_tick())
+    assert spy.extras["max_entry_notional"] == pytest.approx(50_000)          # 잔여 5만 < 16.7만
+
+
+def test_entry_budget_absent_without_cap(session):
+    spy = _Spy()
+    _pipe(session, strategy=spy, deploy_slots=3).run_tick(_tick())
+    assert "max_entry_notional" not in spy.extras
+
+
+def test_breakout_with_budget_buys_affordable_symbol(session):
+    """통합: 비싼 고득점 종목 대신 살 수 있는 종목이 섀도 매수된다 (10-28 재현)."""
+    from src.strategy.breakout import BreakoutStrategy
+
+    kis = _kis()
+    lp = LivePortfolio(session)
+    reg = StrategyRegistry()
+    reg.register(BreakoutStrategy(), allocation_pct=20)
+    om = OrderManager(kis_client=kis, portfolio=lp, now_provider=lambda: datetime(2026, 4, 20, 10), shadow=True)
+    pipe = TradingPipeline(registry=reg, risk_engine=_risk(capital_cap_krw=500_000), order_manager=om,
+                           portfolio=lp, reconciler=Reconciler(session, kis), deploy_slots=3)
+    prices = {"HYNIX": 1_371_000, "CHEAP": 8_930}
+    executed = pipe.run_tick(_tick(
+        cash_available=10_000_000, current_prices=prices,
+        prev_day_ohlc={s: {"open_today": p * 0.95, "high": p * 0.99, "low": p * 0.9} for s, p in prices.items()},
+        liquidity={s: (10**12, 10**10) for s in prices},
+        extras={"news_scores": {"HYNIX": 90.0}},
+    ))
+    assert [s.symbol for s in executed] == ["CHEAP"]
+    assert kis.order.call_count == 0                                            # shadow

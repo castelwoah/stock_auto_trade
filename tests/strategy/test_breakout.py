@@ -133,3 +133,59 @@ def test_news_score_ranks_before_breakout_ratio():
 def test_entry_blocked_symbols_skipped():
     sigs = BreakoutStrategy().decide_entries(_ctx(extras={"entry_blocked": frozenset({"A"})}))
     assert {s.symbol for s in sigs} == {"B"}
+
+
+# --- 살 수 없는 종목 건너뛰기 (10-28) ---------------------------------------
+
+def _priced_ctx(budget=None, **over):
+    """오늘(10-28) 재현: 뉴스 점수 높은 비싼 3종목 + 싼 2종목이 모두 돌파."""
+    prices = {"HYNIX": 1_371_000.0, "SAMSUNG": 230_500.0, "NAVER": 183_500.0,
+              "CHEAP1": 8_930.0, "CHEAP2": 75_100.0}
+    ohlc = {s: {"open_today": p * 0.95, "high": p, "low": p * 0.9} for s, p in prices.items()}   # target = 0.95p + 0.05p = p → +1 로 돌파
+    extras = {"news_scores": {"HYNIX": 90.0, "SAMSUNG": 80.0, "NAVER": 70.0}}
+    if budget is not None:
+        extras["max_entry_notional"] = budget
+    base = dict(cash_available=10_000_000, current_prices={s: p + 1 for s, p in prices.items()},
+                prev_day_ohlc=ohlc, extras=extras)
+    base.update(over)
+    return _ctx(**base)
+
+
+def test_unaffordable_top_ranked_skipped_and_slots_refilled():
+    sigs = BreakoutStrategy().decide_entries(_priced_ctx(budget=166_667))
+    assert [s.symbol for s in sigs] == ["CHEAP1", "CHEAP2"]       # 비싼 3종목 대신 다음 순위
+
+
+def test_without_budget_keeps_previous_ranking():
+    sigs = BreakoutStrategy().decide_entries(_priced_ctx())
+    assert [s.symbol for s in sigs] == ["HYNIX", "SAMSUNG", "NAVER"]
+
+
+def test_budget_partially_affordable_keeps_rank_order():
+    sigs = BreakoutStrategy().decide_entries(_priced_ctx(budget=250_000))
+    assert [s.symbol for s in sigs] == ["SAMSUNG", "NAVER", "CHEAP1"]
+
+
+def test_price_equal_to_budget_is_affordable():
+    ctx = _ctx(extras={"max_entry_notional": 105.0})
+    assert "A" in {s.symbol for s in BreakoutStrategy().decide_entries(ctx)}
+
+
+def test_cash_allocation_also_limits_budget():
+    """상한보다 현금 배분(cash/3)이 작으면 그쪽이 기준."""
+    sigs = BreakoutStrategy().decide_entries(_priced_ctx(budget=10_000_000, cash_available=600_000))
+    assert [s.symbol for s in sigs] == ["NAVER", "CHEAP1", "CHEAP2"]   # 200,000: 삼성 230,501 제외, NAVER 183,501 포함
+
+
+def test_nothing_affordable_no_signals():
+    assert BreakoutStrategy().decide_entries(_priced_ctx(budget=1_000)) == []
+
+
+def test_unaffordable_logged_once_per_day(caplog):
+    caplog.set_level("DEBUG")
+    strat = BreakoutStrategy()
+    strat.decide_entries(_priced_ctx(budget=166_667))
+    strat.decide_entries(_priced_ctx(budget=166_667))
+    infos = [r for r in caplog.records if "skip unaffordable HYNIX" in r.getMessage() and r.levelname == "INFO"]
+    debugs = [r for r in caplog.records if "skip unaffordable HYNIX" in r.getMessage() and r.levelname == "DEBUG"]
+    assert len(infos) == 1 and len(debugs) == 1

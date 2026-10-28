@@ -10,6 +10,8 @@ v4:
   - 유동성 게이트는 TickContext.liquidity 실데이터 사용, 없으면 fail-closed
   - 매수 1건 금액 ≤ min(투입 상한 잔여, 투입 상한 ÷ deploy_slots)
   - risk_blocked 기록은 (날짜, 종목, 전략, 사유) 당 1회 — 같은 신호가 tick 마다 반복돼도 1건
+  - 같은 한도를 tick 시작 시 extras["max_entry_notional"] 로 전략에 넘긴다 — 전략은 1주도
+    못 사는 종목을 후보에서 빼고 다음 순위로 자리를 채운다 (비싼 상위 종목이 슬롯을 막지 않게)
 """
 from __future__ import annotations
 
@@ -39,6 +41,7 @@ logger = logging.getLogger(__name__)
 
 
 ScoreProvider = Callable[[datetime, list[str]], dict[str, float]]
+MAX_ENTRY_KEY = "max_entry_notional"     # StrategyContext.extras — 이번 tick 매수 1건 한도(원)
 
 
 @dataclass
@@ -130,6 +133,10 @@ class TradingPipeline:
             entries_allowed = False
         positions_state = self.portfolio.positions_as_state(current_prices=ctx.current_prices)
         today = ctx.as_of.date()
+        extras = dict(ctx.extras)
+        budget = self._entry_budget(ctx) if entries_allowed else None
+        if budget is not None:
+            extras[MAX_ENTRY_KEY] = budget
         strat_ctx = StrategyContext(
             as_of=ctx.as_of,
             today=today,
@@ -138,7 +145,7 @@ class TradingPipeline:
             candidate_scores=ctx.candidate_scores,
             current_prices=ctx.current_prices,
             prev_day_ohlc=ctx.prev_day_ohlc,
-            extras=dict(ctx.extras),
+            extras=extras,
         )
 
         executed: list[Signal] = []
@@ -156,16 +163,28 @@ class TradingPipeline:
             executed.append(sig)
         return executed
 
+    def _entry_limit(self, existing: dict[str, float]) -> float | None:
+        """매수 1건 한도 = min(투입 상한 잔여, 투입 상한 ÷ deploy_slots). 상한 없으면 None."""
+        left = self.risk.capital_headroom(existing)
+        if left is None:
+            return None
+        limit = max(left, 0.0)
+        cap = self.risk.capital_cap_krw
+        if self.deploy_slots and cap:
+            limit = min(limit, cap / self.deploy_slots)
+        return limit
+
+    def _entry_budget(self, ctx: TickContext) -> float | None:
+        """tick 시작 시점의 매수 1건 한도 — 전략의 후보 선정용 (최종 금액은 신호별로 다시 축소)."""
+        return self._entry_limit(self._existing_notional(ctx))
+
     def _clip_to_capital_cap(self, sig: Signal, buy_ctx: BuyContext) -> tuple[Signal, BuyContext]:
         """매수 금액을 투입 상한 잔여분으로 축소. 잔여 0 이면 그대로 두어
         RiskEngine 의 capital_cap 게이트가 차단·기록하게 한다."""
         left = self.risk.capital_headroom(buy_ctx.existing_positions_notional)
         if left is None or left <= 0:
             return sig, buy_ctx
-        limit = left
-        cap = self.risk.capital_cap_krw
-        if self.deploy_slots and cap:
-            limit = min(limit, cap / self.deploy_slots)
+        limit = self._entry_limit(buy_ctx.existing_positions_notional)
         if sig.notional <= limit:
             return sig, buy_ctx
         logger.info("clip %s notional %.0f → %.0f (capital cap)", sig.symbol, sig.notional, limit)
@@ -241,6 +260,20 @@ class TradingPipeline:
             return False
 
     def _build_buy_context(self, sig: Signal, ctx: TickContext) -> BuyContext:
+        existing = self._existing_notional(ctx)
+        portfolio_value = ctx.portfolio_value if ctx.portfolio_value is not None else self.portfolio.equity(ctx.cash_available, ctx.current_prices)
+        market_cap, avg_value = ctx.liquidity.get(sig.symbol, (None, None))
+        return BuyContext(
+            symbol=sig.symbol,
+            portfolio_value=portfolio_value,
+            existing_positions_notional=existing,
+            market_cap=int(market_cap) if market_cap else None,
+            avg_volume_krw=int(avg_value) if avg_value else None,
+            intended_notional=sig.notional if sig.notional > 0 else None,
+        )
+
+    def _existing_notional(self, ctx: TickContext) -> dict[str, float]:
+        """symbol → 이미 투입된 금액 (보유 평가액 + 미체결 매수 + 섀도 당일 매수)."""
         existing: dict[str, float] = {}
         for pos in self.portfolio.iter_open_positions():
             p = ctx.current_prices.get(pos.symbol, pos.avg_price)
@@ -255,16 +288,7 @@ class TradingPipeline:
                 datetime.combine(d, time.min), datetime.combine(d, time(23, 59, 59)),
             ).items():
                 existing[sym] = existing.get(sym, 0.0) + amount
-        portfolio_value = ctx.portfolio_value if ctx.portfolio_value is not None else self.portfolio.equity(ctx.cash_available, ctx.current_prices)
-        market_cap, avg_value = ctx.liquidity.get(sig.symbol, (None, None))
-        return BuyContext(
-            symbol=sig.symbol,
-            portfolio_value=portfolio_value,
-            existing_positions_notional=existing,
-            market_cap=int(market_cap) if market_cap else None,
-            avg_volume_krw=int(avg_value) if avg_value else None,
-            intended_notional=sig.notional if sig.notional > 0 else None,
-        )
+        return existing
 
     def _execute(
         self, sig: Signal, ctx: TickContext, today: date, buy_ctx: BuyContext | None

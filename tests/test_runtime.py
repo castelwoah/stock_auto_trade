@@ -163,7 +163,9 @@ def test_shadow_capital_cash_reduced_by_shadow_buys_after_restart(factory, tmp_p
     assert (cash, equity) == (10_000_000 - 2 * 72_000, 10_000_000)
 
 
-def test_small_account_without_shadow_capital_records_qty_zero(factory, tmp_path):
+def test_small_account_without_shadow_capital_skips_unaffordable(factory, tmp_path, caplog):
+    """실계좌 상한 2,400 ÷ 3 = 800원 < 72,000 — 신호 자체를 내지 않는다 (qty_zero 도 없음)."""
+    caplog.set_level("INFO")
     kis = FakeKis()
     kis.equity, kis.cash = 48_000.0, 40_875
     rt, clock = _rt(factory, kis, tmp_path=tmp_path)
@@ -172,8 +174,8 @@ def test_small_account_without_shadow_capital_records_qty_zero(factory, tmp_path
     assert rt.tick() == 0
     assert _trades(factory) == []
     with factory() as s:
-        ev = s.query(RiskEvent).filter_by(event_type="risk_blocked").one()
-    assert ev.action_taken == "qty_zero"
+        assert s.query(RiskEvent).filter_by(event_type="risk_blocked").count() == 0
+    assert f"skip unaffordable {SYM}" in caplog.text
 
 
 def test_shadow_capital_ignored_in_live_mode(factory, tmp_path):

@@ -4,19 +4,25 @@
 K 는 일반적으로 0.5.
 진입: 현재가 > 목표가. 빈 자리보다 돌파 종목이 많으면 뉴스 점수 → 돌파율 순으로 고른다
       (ctx.extras["news_scores"]). ctx.extras["entry_blocked"] 종목(뉴스 악재)은 제외.
+      ctx.extras["max_entry_notional"](pipeline 이 넣는 매수 1건 한도)로 1주도 못 사는 종목은
+      후보에서 빼고 다음 순위로 자리를 채운다 (없으면 현금 배분만 기준).
 청산: 장 마감(15:15) 일괄 청산 (당일 청산 전략) — registry 가 스케줄 트리거.
 서브포트폴리오: 전체 현금의 고정 비율(기본 20%) 만 이 전략에 할당 (D2).
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
-from datetime import datetime
+import logging
+from dataclasses import dataclass, field
+from datetime import date, datetime
 
 from src.strategy.base import Action, PositionState, Signal, Strategy, StrategyContext
 from src.strategy.exit_signals import evaluate_exit, make_exit_signal
 
 
+logger = logging.getLogger(__name__)
+
 BREAKOUT_K = 0.5
+MAX_ENTRY_KEY = "max_entry_notional"     # execution.pipeline.MAX_ENTRY_KEY 와 같은 키 (계층 역참조 회피)
 DEFAULT_MAX_POSITIONS = 3
 EOD_CUTOFF_HOUR = 15
 EOD_CUTOFF_MINUTE = 15
@@ -34,6 +40,7 @@ class BreakoutStrategy(Strategy):
     strategy_id: str = "breakout"
     k: float = BREAKOUT_K
     max_positions: int = DEFAULT_MAX_POSITIONS
+    _skip_logged: set[tuple[date, str]] = field(default_factory=set, init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         super().__init__()
@@ -51,6 +58,10 @@ class BreakoutStrategy(Strategy):
             return []
 
         per_position = ctx.cash_available / self.max_positions
+        budget = per_position
+        cap = ctx.extras.get(MAX_ENTRY_KEY)
+        if cap is not None:
+            budget = min(budget, cap)
         news_scores: dict[str, float] = ctx.extras.get("news_scores") or {}
         blocked = ctx.extras.get("entry_blocked") or ()
         triggered: list[tuple[float, float, str, float, float]] = []
@@ -67,6 +78,9 @@ class BreakoutStrategy(Strategy):
                 continue
             target = compute_target_price(open_today, prev_high, prev_low, k=self.k)
             if cur > target:
+                if cur > budget:     # 1주도 못 삼 → 제외, 다음 순위가 자리를 채운다
+                    self._log_unaffordable(ctx.today, symbol, cur, budget)
+                    continue
                 score = news_scores.get(symbol)
                 ratio = (cur - target) / target if target > 0 else 0.0
                 # 뉴스 점수 높은 순 (점수 없는 예비 종목은 뒤) → 돌파율 높은 순 → 코드 순
@@ -92,6 +106,13 @@ class BreakoutStrategy(Strategy):
                 )
             )
         return signals
+
+    def _log_unaffordable(self, today: date, symbol: str, price: float, budget: float) -> None:
+        key = (today, symbol)
+        first = key not in self._skip_logged
+        self._skip_logged.add(key)
+        logger.log(logging.INFO if first else logging.DEBUG,
+                   "skip unaffordable %s: %.0f > budget %.0f", symbol, price, budget)
 
     # ------------------------------------------------------------------
     # Exits
