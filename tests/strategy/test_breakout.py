@@ -189,3 +189,25 @@ def test_unaffordable_logged_once_per_day(caplog):
     infos = [r for r in caplog.records if "skip unaffordable HYNIX" in r.getMessage() and r.levelname == "INFO"]
     debugs = [r for r in caplog.records if "skip unaffordable HYNIX" in r.getMessage() and r.levelname == "DEBUG"]
     assert len(infos) == 1 and len(debugs) == 1
+
+
+# --- 유동성 미달 종목 건너뛰기 (10-29) ---------------------------------------
+
+def test_illiquid_top_ranked_skipped_and_slots_refilled():
+    ctx = _priced_ctx(budget=10_000_000)
+    ctx.extras["entry_illiquid"] = frozenset({"HYNIX"})
+    sigs = BreakoutStrategy().decide_entries(ctx)
+    assert [s.symbol for s in sigs] == ["SAMSUNG", "NAVER", "CHEAP1"]     # HYNIX 대신 다음 순위
+
+
+def test_illiquid_and_unaffordable_logged_separately(caplog):
+    caplog.set_level("DEBUG")
+    ctx = _priced_ctx(budget=166_667)
+    ctx.extras["entry_illiquid"] = frozenset({"CHEAP1"})
+    strat = BreakoutStrategy()
+    assert [s.symbol for s in strat.decide_entries(ctx)] == ["CHEAP2"]
+    strat.decide_entries(ctx)
+    msgs = [(r.levelname, r.getMessage()) for r in caplog.records]
+    assert msgs.count(("INFO", "skip illiquid CHEAP1")) == 1
+    assert msgs.count(("DEBUG", "skip illiquid CHEAP1")) == 1
+    assert sum(1 for lv, m in msgs if lv == "INFO" and m.startswith("skip unaffordable HYNIX")) == 1

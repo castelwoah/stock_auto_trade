@@ -6,6 +6,8 @@ K 는 일반적으로 0.5.
       (ctx.extras["news_scores"]). ctx.extras["entry_blocked"] 종목(뉴스 악재)은 제외.
       ctx.extras["max_entry_notional"](pipeline 이 넣는 매수 1건 한도)로 1주도 못 사는 종목은
       후보에서 빼고 다음 순위로 자리를 채운다 (없으면 현금 배분만 기준).
+      ctx.extras["entry_illiquid"](pipeline 이 넣는 유동성 미달 종목)도 같은 방식으로 제외 —
+      리스크 게이트에서 막힐 종목이 자리를 차지하지 않게.
 청산: 장 마감(15:15) 일괄 청산 (당일 청산 전략) — registry 가 스케줄 트리거.
 서브포트폴리오: 전체 현금의 고정 비율(기본 20%) 만 이 전략에 할당 (D2).
 """
@@ -23,6 +25,7 @@ logger = logging.getLogger(__name__)
 
 BREAKOUT_K = 0.5
 MAX_ENTRY_KEY = "max_entry_notional"     # execution.pipeline.MAX_ENTRY_KEY 와 같은 키 (계층 역참조 회피)
+ILLIQUID_KEY = "entry_illiquid"          # execution.pipeline.ILLIQUID_KEY 와 같은 키
 DEFAULT_MAX_POSITIONS = 3
 EOD_CUTOFF_HOUR = 15
 EOD_CUTOFF_MINUTE = 15
@@ -40,7 +43,7 @@ class BreakoutStrategy(Strategy):
     strategy_id: str = "breakout"
     k: float = BREAKOUT_K
     max_positions: int = DEFAULT_MAX_POSITIONS
-    _skip_logged: set[tuple[date, str]] = field(default_factory=set, init=False, repr=False, compare=False)
+    _skip_logged: set[tuple[date, str, str]] = field(default_factory=set, init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         super().__init__()
@@ -64,6 +67,7 @@ class BreakoutStrategy(Strategy):
             budget = min(budget, cap)
         news_scores: dict[str, float] = ctx.extras.get("news_scores") or {}
         blocked = ctx.extras.get("entry_blocked") or ()
+        illiquid = ctx.extras.get(ILLIQUID_KEY) or ()
         triggered: list[tuple[float, float, str, float, float]] = []
         for symbol, cur in ctx.current_prices.items():
             if symbol in owned or symbol in blocked:
@@ -78,8 +82,12 @@ class BreakoutStrategy(Strategy):
                 continue
             target = compute_target_price(open_today, prev_high, prev_low, k=self.k)
             if cur > target:
+                if symbol in illiquid:   # 유동성 미달 → 게이트에서 막힐 종목, 다음 순위가 자리를 채운다
+                    self._log_skip(ctx.today, symbol, "illiquid", "skip illiquid %s", symbol)
+                    continue
                 if cur > budget:     # 1주도 못 삼 → 제외, 다음 순위가 자리를 채운다
-                    self._log_unaffordable(ctx.today, symbol, cur, budget)
+                    self._log_skip(ctx.today, symbol, "unaffordable",
+                                   "skip unaffordable %s: %.0f > budget %.0f", symbol, cur, budget)
                     continue
                 score = news_scores.get(symbol)
                 ratio = (cur - target) / target if target > 0 else 0.0
@@ -107,12 +115,12 @@ class BreakoutStrategy(Strategy):
             )
         return signals
 
-    def _log_unaffordable(self, today: date, symbol: str, price: float, budget: float) -> None:
-        key = (today, symbol)
+    def _log_skip(self, today: date, symbol: str, kind: str, msg: str, *args) -> None:
+        """후보 제외 로그 — (날짜, 종목, 사유) 당 첫 번째만 INFO, 이후 DEBUG."""
+        key = (today, symbol, kind)
         first = key not in self._skip_logged
         self._skip_logged.add(key)
-        logger.log(logging.INFO if first else logging.DEBUG,
-                   "skip unaffordable %s: %.0f > budget %.0f", symbol, price, budget)
+        logger.log(logging.INFO if first else logging.DEBUG, msg, *args)
 
     # ------------------------------------------------------------------
     # Exits

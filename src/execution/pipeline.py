@@ -12,6 +12,8 @@ v4:
   - risk_blocked 기록은 (날짜, 종목, 전략, 사유) 당 1회 — 같은 신호가 tick 마다 반복돼도 1건
   - 같은 한도를 tick 시작 시 extras["max_entry_notional"] 로 전략에 넘긴다 — 전략은 1주도
     못 사는 종목을 후보에서 빼고 다음 순위로 자리를 채운다 (비싼 상위 종목이 슬롯을 막지 않게)
+  - 유동성 미달 종목도 extras["entry_illiquid"] 로 넘겨 후보에서 뺀다 — 게이트와 같은 판정
+    (check_liquidity · 같은 임계값). 게이트는 그대로 2차 방어
   - 섀도 모드 + shadow_book: 섀도 기록으로 만든 가상 포지션을 전략에 넘겨 청산 신호까지 섀도로
     실행하고, 투입액도 가상 보유 평가액으로 계산한다. 가상 포지션을 못 읽으면 그 tick 매수만 차단
 """
@@ -32,6 +34,7 @@ from src.execution.portfolio import LivePortfolio
 from src.execution.reconciler import Reconciler
 from src.execution.shadow_book import ShadowBook
 from src.persistence.models import RiskEvent
+from src.risk.blacklist import check_liquidity
 from src.risk.exceptions import RiskBlocked
 from src.risk.limits import BuyContext, RiskEngine, set_risk_engine
 from src.risk.sizing import resolve_quantity
@@ -45,6 +48,7 @@ logger = logging.getLogger(__name__)
 
 ScoreProvider = Callable[[datetime, list[str]], dict[str, float]]
 MAX_ENTRY_KEY = "max_entry_notional"     # StrategyContext.extras — 이번 tick 매수 1건 한도(원)
+ILLIQUID_KEY = "entry_illiquid"          # StrategyContext.extras — 이번 tick 유동성 미달 종목
 
 
 @dataclass
@@ -155,6 +159,8 @@ class TradingPipeline:
         budget = self._entry_budget(ctx) if entries_allowed else None
         if budget is not None:
             extras[MAX_ENTRY_KEY] = budget
+        if entries_allowed:
+            extras[ILLIQUID_KEY] = self._illiquid(ctx)
         strat_ctx = StrategyContext(
             as_of=ctx.as_of,
             today=today,
@@ -195,6 +201,20 @@ class TradingPipeline:
     def _entry_budget(self, ctx: TickContext) -> float | None:
         """tick 시작 시점의 매수 1건 한도 — 전략의 후보 선정용 (최종 금액은 신호별로 다시 축소)."""
         return self._entry_limit(self._existing_notional(ctx))
+
+    def _illiquid(self, ctx: TickContext) -> frozenset[str]:
+        """유동성 게이트를 통과 못 할 종목 — check_buy 와 같은 함수·임계값 (데이터 없음도 미달)."""
+        out = set()
+        for sym in ctx.current_prices:
+            market_cap, avg_value = ctx.liquidity.get(sym, (None, None))
+            ok, _ = check_liquidity(
+                market_cap=int(market_cap) if market_cap else None,
+                avg_volume_krw=int(avg_value) if avg_value else None,
+                thresholds=self.risk.liquidity_thresholds,
+            )
+            if not ok:
+                out.add(sym)
+        return frozenset(out)
 
     def _clip_to_capital_cap(self, sig: Signal, buy_ctx: BuyContext) -> tuple[Signal, BuyContext]:
         """매수 금액을 투입 상한 잔여분으로 축소. 잔여 0 이면 그대로 두어

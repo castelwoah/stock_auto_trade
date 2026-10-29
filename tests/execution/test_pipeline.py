@@ -678,3 +678,60 @@ def test_real_position_takes_priority_over_virtual(session):
     pipe.shadow_book = ShadowBook(session, since=datetime(2026, 1, 1))
     pipe.run_tick(_tick())
     assert spy.positions["A"].qty == 7
+
+
+# --- 유동성 미달 종목 후보 제외 (10-29) ----------------------------------------
+
+def test_illiquid_set_passed_to_strategy(session):
+    spy = _Spy()
+    liq = {"A": LIQ["A"], "THIN": (10**12, 24_157_567), "SMALL": (10**10, 10**10), "NODATA": (None, 10**10)}
+    _pipe(session, strategy=spy).run_tick(_tick(
+        current_prices={"A": 1000, "THIN": 7000, "SMALL": 1000, "NODATA": 1000}, liquidity=liq))
+    assert spy.extras["entry_illiquid"] == frozenset({"THIN", "SMALL", "NODATA"})   # 거래대금·시총·데이터 없음
+
+
+def test_illiquid_uses_engine_thresholds(session):
+    from src.risk.blacklist import LiquidityThresholds
+
+    spy = _Spy()
+    risk = _risk(liquidity_thresholds=LiquidityThresholds(min_market_cap_krw=1, min_avg_volume_krw=1))
+    _pipe(session, risk=risk, strategy=spy).run_tick(_tick(liquidity={"A": (10, 10)}))
+    assert spy.extras["entry_illiquid"] == frozenset()
+
+
+def test_illiquid_absent_when_entries_blocked(session):
+    spy = _Spy()
+    _pipe(session, strategy=spy).run_tick(_tick(block_entries_reason="balance stale"))
+    assert "entry_illiquid" not in spy.extras
+
+
+def test_breakout_skips_illiquid_and_buys_next(session):
+    """통합: 유동성 미달 1순위(036630 재현)가 자리를 차지하지 않고 다음 순위가 매수된다."""
+    from src.strategy.breakout import BreakoutStrategy
+
+    kis = _kis()
+    lp = LivePortfolio(session)
+    reg = StrategyRegistry()
+    reg.register(BreakoutStrategy(max_positions=1), allocation_pct=20)
+    om = OrderManager(kis_client=kis, portfolio=lp, now_provider=lambda: datetime(2026, 4, 20, 10), shadow=True)
+    pipe = TradingPipeline(registry=reg, risk_engine=_risk(capital_cap_krw=500_000), order_manager=om,
+                           portfolio=lp, reconciler=Reconciler(session, kis), deploy_slots=3)
+    prices = {"THIN": 7_320, "OK": 8_930}
+    executed = pipe.run_tick(_tick(
+        cash_available=10_000_000, current_prices=prices,
+        prev_day_ohlc={s: {"open_today": p * 0.95, "high": p * 0.99, "low": p * 0.9} for s, p in prices.items()},
+        liquidity={"THIN": (10**12, 24_157_567), "OK": (10**12, 10**10)},
+        extras={"news_scores": {"THIN": 90.0}},
+    ))
+    assert [s.symbol for s in executed] == ["OK"]
+    assert _blocks(session) == []                                       # 게이트까지 가지 않음
+
+
+def test_illiquid_virtual_holding_still_liquidated(session):
+    clock = [datetime(2026, 10, 29, 10, 0)]
+    pipe, book, _ = _shadow_breakout(session, clock)
+    pipe.run_tick(_btick(clock, 10_000))
+    clock[0] = datetime(2026, 10, 29, 15, 15)
+    pipe.run_tick(_btick(clock, 10_100, liquidity={"CHEAP": (10**12, 1)}))      # 보유 중 유동성 미달
+    assert _shadow_rows(session)[-1] == ("SELL", 16, 10_100, "eod_liquidation")
+    assert book.open_positions() == {}
